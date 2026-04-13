@@ -10,7 +10,7 @@ if (!SECRET) {
 }
 
 function readUsers() {
-  return JSON.parse(fs.readFileSync(USERS_FILE));
+  return JSON.parse(fs.readFileSync(USERS_FILE, "utf8"));
 }
 
 function writeUsers(users) {
