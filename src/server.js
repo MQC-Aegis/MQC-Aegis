@@ -1,826 +1,627 @@
 import http from "http";
 import express from "express";
+import path from "path";
+import { fileURLToPath } from "url";
 import { WebSocketServer } from "ws";
 import sqlite3 from "sqlite3";
 import { open } from "sqlite";
 
 const app = express();
 app.use(express.json());
-app.use(express.static("public_dashboard"));
 
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
+const HOST = process.env.HOST || "0.0.0.0";
+const NODE_ENV = process.env.NODE_ENV || "development";
+const DB_FILE = path.resolve(process.env.DB_FILE || "./signaldesk.db");
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const publicDir = path.join(__dirname, "..", "public_dashboard");
+
+app.use(express.static(publicDir));
 
 let db;
-let wss;
+let isShuttingDown = false;
 
-const eventStore = [];
 const incidentStore = [];
 const actionStore = [];
-const trendStore = new Map();
-const userHistory = new Map();
-const actionCooldown = new Map();
+const eventStore = [];
 
-function nowIso() {
-  return new Date().toISOString();
+function resetArray(target, items) {
+  target.length = 0;
+  target.push(...items);
 }
 
-function nowMs() {
-  return Date.now();
-}
-
-function safeNum(v, fallback = 0) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : fallback;
-}
-
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
-}
-
-function uniq(arr) {
-  return [...new Set((arr || []).filter(Boolean))];
-}
-
-function broadcast(type, payload) {
-  if (!wss) return;
-  const msg = JSON.stringify({ type, payload });
-  for (const client of wss.clients) {
-    if (client.readyState === 1) client.send(msg);
-  }
-}
-
-function computeFingerprint(event) {
-  return [
-    event.type || "unknown",
-    event.user || "anonymous",
-    event.ip || "unknown",
-    event.geoMismatch ? "geo1" : "geo0",
-    event.velocitySpike ? "vel1" : "vel0",
-    safeNum(event.amount, 0) >= 5000 ? "amt_hi" : "amt_lo"
-  ].join("|");
-}
-
-function getSeverity(score) {
-  if (score >= 85) return "critical";
-  if (score >= 65) return "high";
-  if (score >= 40) return "medium";
-  return "low";
-}
-
-function severityRank(sev) {
-  if (sev === "critical") return 4;
-  if (sev === "high") return 3;
-  if (sev === "medium") return 2;
-  return 1;
-}
-
-function pickHigherSeverity(a, b) {
-  return severityRank(a) >= severityRank(b) ? a : b;
-}
-
-function getRecommendedAction(score, correlationLabel, trendLabel) {
-  if (correlationLabel === "multi_signal_attack") return "block";
-  if (correlationLabel === "payment_takeover_pattern") return "block";
-  if (score >= 85) return "block";
-  if (correlationLabel === "cross_signal_escalation") return "manual_review";
-  if (score >= 65) return "manual_review";
-  if (trendLabel === "surge" || trendLabel === "spike") return "rate_limit";
-  return "log";
-}
-
-function actionRank(action) {
-  if (action === "block") return 4;
-  if (action === "manual_review") return 3;
-  if (action === "rate_limit") return 2;
-  return 1;
-}
-
-function strongerAction(a, b) {
-  return actionRank(a) >= actionRank(b) ? a : b;
-}
-
-function updateTrend(event) {
-  const key = event.type || "unknown";
-  const bucket = trendStore.get(key) || { count: 0, totalRisk: 0, lastAt: nowMs() };
-
-  bucket.count += 1;
-  bucket.totalRisk += safeNum(event.risk, 0);
-  bucket.lastAt = nowMs();
-
-  trendStore.set(key, bucket);
-
-  const avgRisk = bucket.totalRisk / bucket.count;
-
-  if (bucket.count >= 8 && avgRisk >= 50) return "surge";
-  if (bucket.count >= 4 || avgRisk >= 35 || event.velocitySpike) return "spike";
-  return "normal";
-}
-
-function rememberUserEvent(event) {
-  const key = event.user || "anonymous";
-  const history = userHistory.get(key) || [];
-
-  history.push({
-    type: event.type,
-    risk: safeNum(event.risk, 0),
-    amount: safeNum(event.amount, 0),
-    ip: event.ip || "unknown",
-    geoMismatch: !!event.geoMismatch,
-    velocitySpike: !!event.velocitySpike,
-    createdAtMs: nowMs()
-  });
-
-  const cutoff = nowMs() - 10 * 60 * 1000;
-  const trimmed = history.filter((e) => e.createdAtMs >= cutoff);
-  userHistory.set(key, trimmed);
-  return trimmed;
-}
-
-function detectCorrelation(event, recentUserEvents) {
-  const reasonCodes = [];
-  let correlationLabel = "none";
-
-  const risk = safeNum(event.risk, 0);
-  const amount = safeNum(event.amount, 0);
-  const unseenIp = !event.ip || event.ip === "unknown";
-
-  if (risk >= 85) reasonCodes.push("RISK_OVER_85");
-  if (event.velocitySpike) reasonCodes.push("VELOCITY_SPIKE");
-  if (event.geoMismatch) reasonCodes.push("GEO_MISMATCH");
-  if (unseenIp) reasonCodes.push("UNSEEN_IP");
-  if (amount >= 5000) reasonCodes.push("HIGH_AMOUNT");
-
-  const recentCount = recentUserEvents.length;
-  const recentHighRiskCount = recentUserEvents.filter((e) => e.risk >= 70).length;
-  const recentTypes = new Set(recentUserEvents.map((e) => e.type));
-
-  if (event.type === "login" && event.velocitySpike && unseenIp) {
-    correlationLabel = "multi_signal_attack";
-  }
-
-  if (event.type === "payment" && amount >= 5000 && event.geoMismatch) {
-    correlationLabel = "payment_takeover_pattern";
-  }
-
-  if (recentCount >= 3 && recentHighRiskCount >= 2 && recentTypes.size >= 2) {
-    correlationLabel = "cross_signal_escalation";
-    reasonCodes.push("MULTI_EVENT_CLUSTER");
-  }
-
-  if (recentCount >= 4) {
-    reasonCodes.push("REPEATED_ACTIVITY");
-  }
-
+function normalizeEvent(input = {}) {
   return {
-    correlationLabel,
-    reasonCodes: uniq(reasonCodes)
+    type: String(input.type || "unknown").toLowerCase(),
+    user: String(input.user || "anonymous"),
+    amount: Number(input.amount || 0),
+    risk: Number(input.risk || 0),
+    attempts: Number(input.attempts || 0),
+    ip: String(input.ip || "unknown"),
+    geoMismatch: Boolean(input.geoMismatch || false),
+    velocitySpike: Boolean(input.velocitySpike || false),
+    timestamp: new Date().toISOString()
   };
 }
 
-function buildRiskScore(event, correlationLabel, trendLabel, recentUserEvents) {
-  let score = safeNum(event.risk, 0);
-
-  if (event.velocitySpike) score += 20;
-  if (event.geoMismatch) score += 18;
-  if ((event.ip || "unknown") === "unknown") score += 12;
-  if (event.type === "payment" && safeNum(event.amount, 0) >= 5000) score += 25;
-  if (event.type === "login" && safeNum(event.attempts, 0) >= 5) score += 15;
-
-  if (trendLabel === "spike") score += 10;
-  if (trendLabel === "surge") score += 18;
-
-  if (correlationLabel === "multi_signal_attack") score += 30;
-  if (correlationLabel === "payment_takeover_pattern") score += 28;
-  if (correlationLabel === "cross_signal_escalation") score += 22;
-
-  if (recentUserEvents.length >= 3) score += 10;
-
-  return clamp(score, 0, 99);
+function getRecentEvents({ user, seconds = 120 }) {
+  const cutoff = Date.now() - seconds * 1000;
+  return eventStore.filter((item) => {
+    return item.user === user && new Date(item.timestamp).getTime() >= cutoff;
+  });
 }
 
-function shouldCreateOrMergeIncident(event, riskScore, correlationLabel, trendLabel) {
-  if (correlationLabel !== "none") return true;
-  if (trendLabel !== "normal" && riskScore >= 55) return true;
-  if (riskScore >= 65) return true;
-  if (event.type === "payment" && safeNum(event.amount, 0) >= 5000) return true;
-  return false;
+function detectTrendAnomaly(event) {
+  const recentUserEvents = getRecentEvents({ user: event.user, seconds: 120 });
+  const sameTypeCount = recentUserEvents.filter((e) => e.type === event.type).length;
+
+  if (recentUserEvents.length >= 5 || sameTypeCount >= 4) {
+    return { label: "spike", scoreBoost: 20, reasonCodes: ["TREND_SPIKE"] };
+  }
+
+  if (recentUserEvents.length >= 3 || sameTypeCount >= 2) {
+    return { label: "elevated", scoreBoost: 10, reasonCodes: ["TREND_ELEVATED"] };
+  }
+
+  return { label: "normal", scoreBoost: 0, reasonCodes: [] };
 }
 
-function findOpenIncidentByFingerprint(fingerprint) {
-  return incidentStore.find(
-    (i) => i.fingerprint === fingerprint && i.status !== "resolved" && i.status !== "closed"
-  );
+function detectCorrelation(event) {
+  let signals = 0;
+  const reasonCodes = [];
+
+  if (event.velocitySpike) { signals += 1; reasonCodes.push("VELOCITY_SPIKE"); }
+  if (event.geoMismatch) { signals += 1; reasonCodes.push("GEO_MISMATCH"); }
+  if (event.attempts >= 3) { signals += 1; reasonCodes.push("REPEAT_ATTEMPTS"); }
+  if (event.amount > 10000) { signals += 1; reasonCodes.push("HIGH_AMOUNT"); }
+  if (event.ip === "unknown") { signals += 1; reasonCodes.push("UNSEEN_IP"); }
+  if (event.risk >= 60) { signals += 1; reasonCodes.push("BASE_RISK_HIGH"); }
+
+  if (signals >= 4) {
+    return { label: "critical_chain", scoreBoost: 25, reasonCodes };
+  }
+
+  if (signals >= 2) {
+    return { label: "multi_signal", scoreBoost: 12, reasonCodes };
+  }
+
+  return { label: "none", scoreBoost: 0, reasonCodes };
 }
 
-function shouldCreateAction(incidentId, action) {
-  const key = `${incidentId}|${action}`;
-  const last = actionCooldown.get(key);
-  const now = nowMs();
+function calculateRiskScore(event, trend, correlation) {
+  let score = 0;
+  const reasonCodes = [];
 
-  if (last && now - last < 60 * 1000) return false;
+  score += event.risk;
+  if (event.risk > 0) reasonCodes.push("BASE_RISK");
 
-  actionCooldown.set(key, now);
-  return true;
+  if (event.attempts >= 3) { score += 20; reasonCodes.push("ATTEMPTS_OVER_3"); }
+  if (event.amount > 10000) { score += 25; reasonCodes.push("AMOUNT_OVER_10000"); }
+  if (event.geoMismatch) { score += 20; reasonCodes.push("GEO_MISMATCH"); }
+  if (event.velocitySpike) { score += 15; reasonCodes.push("VELOCITY_SPIKE"); }
+  if (event.ip === "unknown") { score += 10; reasonCodes.push("UNKNOWN_IP"); }
+
+  score += trend.scoreBoost;
+  score += correlation.scoreBoost;
+
+  reasonCodes.push(...trend.reasonCodes);
+  reasonCodes.push(...correlation.reasonCodes);
+
+  if (score > 100) score = 100;
+
+  return {
+    score,
+    reasonCodes: [...new Set(reasonCodes)]
+  };
+}
+
+function decideAction(riskScore, context) {
+  if (riskScore >= 90 || context.correlationLabel === "critical_chain") {
+    return {
+      action: "block",
+      severity: "critical",
+      status: "pending_review",
+      reason: "Critical multi-signal risk detected"
+    };
+  }
+
+  if (
+    riskScore >= 70 ||
+    context.trendLabel === "spike" ||
+    context.correlationLabel === "multi_signal"
+  ) {
+    return {
+      action: "manual_review",
+      severity: "high",
+      status: "open",
+      reason: "Escalated risk pattern requires analyst review"
+    };
+  }
+
+  if (riskScore >= 40 || context.trendLabel === "elevated") {
+    return {
+      action: "rate_limit",
+      severity: "medium",
+      status: "monitor",
+      reason: "Risk is elevated and should be monitored"
+    };
+  }
+
+  return {
+    action: "allow",
+    severity: "low",
+    status: "ok",
+    reason: "Risk is within acceptable range"
+  };
+}
+
+function createIncident(event, riskScore, decision, trend, correlation, reasonCodes) {
+  return {
+    type: event.type,
+    user: event.user,
+    amount: event.amount,
+    ip: event.ip,
+    risk: event.risk,
+    riskScore,
+    severity: decision.severity,
+    action: decision.action,
+    status: decision.status,
+    reason: decision.reason,
+    reasonCodes,
+    trendLabel: trend.label,
+    correlationLabel: correlation.label,
+    geoMismatch: event.geoMismatch,
+    velocitySpike: event.velocitySpike,
+    attempts: event.attempts,
+    createdAt: event.timestamp
+  };
+}
+
+function createActionLog(event, riskScore, decision, incidentId, trendLabel, correlationLabel) {
+  return {
+    incidentId,
+    user: event.user,
+    type: event.type,
+    action: decision.action,
+    severity: decision.severity,
+    status: decision.status,
+    reason: decision.reason,
+    riskScore,
+    trendLabel,
+    correlationLabel,
+    createdAt: event.timestamp
+  };
+}
+
+function parseBooleanParam(value) {
+  if (value === undefined) return undefined;
+  if (value === "true" || value === "1") return true;
+  if (value === "false" || value === "0") return false;
+  return undefined;
+}
+
+function parsePositiveInt(value, fallback) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (Number.isNaN(parsed) || parsed <= 0) return fallback;
+  return parsed;
+}
+
+function applyIncidentFilters(items, query) {
+  const severity = query.severity ? String(query.severity).toLowerCase() : null;
+  const type = query.type ? String(query.type).toLowerCase() : null;
+  const action = query.action ? String(query.action).toLowerCase() : null;
+  const status = query.status ? String(query.status).toLowerCase() : null;
+  const user = query.user ? String(query.user).toLowerCase() : null;
+  const trendLabel = query.trendLabel ? String(query.trendLabel).toLowerCase() : null;
+  const correlationLabel = query.correlationLabel ? String(query.correlationLabel).toLowerCase() : null;
+  const geoMismatch = parseBooleanParam(query.geoMismatch);
+  const velocitySpike = parseBooleanParam(query.velocitySpike);
+  const minRiskScore = query.minRiskScore !== undefined ? Number(query.minRiskScore) : null;
+  const maxRiskScore = query.maxRiskScore !== undefined ? Number(query.maxRiskScore) : null;
+  const limit = parsePositiveInt(query.limit, 50);
+
+  return items
+    .filter((item) => !severity || item.severity?.toLowerCase() === severity)
+    .filter((item) => !type || item.type?.toLowerCase() === type)
+    .filter((item) => !action || item.action?.toLowerCase() === action)
+    .filter((item) => !status || item.status?.toLowerCase() === status)
+    .filter((item) => !user || item.user?.toLowerCase().includes(user))
+    .filter((item) => !trendLabel || item.trendLabel?.toLowerCase() === trendLabel)
+    .filter((item) => !correlationLabel || item.correlationLabel?.toLowerCase() === correlationLabel)
+    .filter((item) => geoMismatch === undefined || item.geoMismatch === geoMismatch)
+    .filter((item) => velocitySpike === undefined || item.velocitySpike === velocitySpike)
+    .filter((item) => minRiskScore === null || item.riskScore >= minRiskScore)
+    .filter((item) => maxRiskScore === null || item.riskScore <= maxRiskScore)
+    .slice(0, limit);
+}
+
+function applyActionFilters(items, query) {
+  const severity = query.severity ? String(query.severity).toLowerCase() : null;
+  const type = query.type ? String(query.type).toLowerCase() : null;
+  const action = query.action ? String(query.action).toLowerCase() : null;
+  const status = query.status ? String(query.status).toLowerCase() : null;
+  const user = query.user ? String(query.user).toLowerCase() : null;
+  const trendLabel = query.trendLabel ? String(query.trendLabel).toLowerCase() : null;
+  const correlationLabel = query.correlationLabel ? String(query.correlationLabel).toLowerCase() : null;
+  const minRiskScore = query.minRiskScore !== undefined ? Number(query.minRiskScore) : null;
+  const maxRiskScore = query.maxRiskScore !== undefined ? Number(query.maxRiskScore) : null;
+  const limit = parsePositiveInt(query.limit, 50);
+
+  return items
+    .filter((item) => !severity || item.severity?.toLowerCase() === severity)
+    .filter((item) => !type || item.type?.toLowerCase() === type)
+    .filter((item) => !action || item.action?.toLowerCase() === action)
+    .filter((item) => !status || item.status?.toLowerCase() === status)
+    .filter((item) => !user || item.user?.toLowerCase().includes(user))
+    .filter((item) => !trendLabel || item.trendLabel?.toLowerCase() === trendLabel)
+    .filter((item) => !correlationLabel || item.correlationLabel?.toLowerCase() === correlationLabel)
+    .filter((item) => minRiskScore === null || item.riskScore >= minRiskScore)
+    .filter((item) => maxRiskScore === null || item.riskScore <= maxRiskScore)
+    .slice(0, limit);
+}
+
+function countBy(items, key, allowedValues = []) {
+  const initial = Object.fromEntries(allowedValues.map((value) => [value, 0]));
+  for (const item of items) {
+    const value = item?.[key] ?? "unknown";
+    initial[value] = (initial[value] || 0) + 1;
+  }
+  return initial;
+}
+
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
+
+function broadcast(payload) {
+  const message = JSON.stringify(payload);
+  for (const client of wss.clients) {
+    if (client.readyState === 1) {
+      client.send(message);
+    }
+  }
 }
 
 async function initDb() {
   db = await open({
-    filename: "./signaldesk.db",
+    filename: DB_FILE,
     driver: sqlite3.Database
   });
 
   await db.exec(`
+    PRAGMA journal_mode = WAL;
+
     CREATE TABLE IF NOT EXISTS events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       type TEXT,
       user TEXT,
       amount REAL,
+      risk INTEGER,
       attempts INTEGER,
       ip TEXT,
-      risk INTEGER,
       geoMismatch INTEGER,
       velocitySpike INTEGER,
-      createdAt TEXT
+      timestamp TEXT
     );
 
     CREATE TABLE IF NOT EXISTS incidents (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       type TEXT,
       user TEXT,
+      amount REAL,
+      ip TEXT,
+      risk INTEGER,
       riskScore INTEGER,
       severity TEXT,
       action TEXT,
       status TEXT,
-      ip TEXT,
-      amount REAL,
+      reason TEXT,
       reasonCodes TEXT,
-      correlationLabel TEXT,
       trendLabel TEXT,
-      fingerprint TEXT,
-      hitCount INTEGER DEFAULT 1,
-      merged INTEGER DEFAULT 0,
-      firstSeenAt TEXT,
-      lastSeenAt TEXT,
+      correlationLabel TEXT,
+      geoMismatch INTEGER,
+      velocitySpike INTEGER,
+      attempts INTEGER,
       createdAt TEXT
     );
 
     CREATE TABLE IF NOT EXISTS actions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       incidentId INTEGER,
+      user TEXT,
+      type TEXT,
       action TEXT,
+      severity TEXT,
+      status TEXT,
       reason TEXT,
+      riskScore INTEGER,
+      trendLabel TEXT,
+      correlationLabel TEXT,
       createdAt TEXT
     );
   `);
-
-  const incidentCols = await db.all(`PRAGMA table_info(incidents)`);
-  const incidentColNames = new Set(incidentCols.map((c) => c.name));
-
-  if (!incidentColNames.has("hitCount")) {
-    await db.exec(`ALTER TABLE incidents ADD COLUMN hitCount INTEGER DEFAULT 1`);
-  }
-  if (!incidentColNames.has("merged")) {
-    await db.exec(`ALTER TABLE incidents ADD COLUMN merged INTEGER DEFAULT 0`);
-  }
-  if (!incidentColNames.has("firstSeenAt")) {
-    await db.exec(`ALTER TABLE incidents ADD COLUMN firstSeenAt TEXT`);
-  }
-  if (!incidentColNames.has("lastSeenAt")) {
-    await db.exec(`ALTER TABLE incidents ADD COLUMN lastSeenAt TEXT`);
-  }
 }
 
-async function loadRecentStateFromDb() {
-  const incidents = await db.all(`
-    SELECT *
-    FROM incidents
-    ORDER BY id DESC
-    LIMIT 100
-  `);
-
-  for (const row of incidents) {
-    incidentStore.push({
-      id: row.id,
-      type: row.type,
-      user: row.user,
-      riskScore: row.riskScore,
-      severity: row.severity,
-      action: row.action,
-      status: row.status,
-      ip: row.ip,
-      amount: row.amount,
-      reasonCodes: (() => {
-        try {
-          return JSON.parse(row.reasonCodes || "[]");
-        } catch {
-          return [];
-        }
-      })(),
-      correlationLabel: row.correlationLabel,
-      trendLabel: row.trendLabel,
-      fingerprint: row.fingerprint,
-      hitCount: row.hitCount || 1,
-      merged: !!row.merged,
-      firstSeenAt: row.firstSeenAt || row.createdAt,
-      lastSeenAt: row.lastSeenAt || row.createdAt,
-      createdAt: row.createdAt
-    });
-  }
-
-  const actions = await db.all(`
-    SELECT *
-    FROM actions
-    ORDER BY id DESC
-    LIMIT 100
-  `);
-
-  for (const row of actions) {
-    actionStore.push({
-      id: row.id,
-      incidentId: row.incidentId,
-      action: row.action,
-      reason: row.reason,
-      createdAt: row.createdAt
-    });
-  }
-}
-
-async function persistEvent(event) {
-  await db.run(
-    `INSERT INTO events (type, user, amount, attempts, ip, risk, geoMismatch, velocitySpike, createdAt)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      event.type || "unknown",
-      event.user || "anonymous",
-      safeNum(event.amount, 0),
-      safeNum(event.attempts, 0),
-      event.ip || "unknown",
-      safeNum(event.risk, 0),
-      event.geoMismatch ? 1 : 0,
-      event.velocitySpike ? 1 : 0,
-      event.createdAt
-    ]
-  );
-}
-
-async function createIncidentRecord(incident) {
-  const result = await db.run(
-    `INSERT INTO incidents
-      (type, user, riskScore, severity, action, status, ip, amount, reasonCodes, correlationLabel, trendLabel, fingerprint, hitCount, merged, firstSeenAt, lastSeenAt, createdAt)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      incident.type,
-      incident.user,
-      incident.riskScore,
-      incident.severity,
-      incident.action,
-      incident.status,
-      incident.ip,
-      incident.amount,
-      JSON.stringify(incident.reasonCodes),
-      incident.correlationLabel,
-      incident.trendLabel,
-      incident.fingerprint,
-      incident.hitCount,
-      incident.merged ? 1 : 0,
-      incident.firstSeenAt,
-      incident.lastSeenAt,
-      incident.createdAt
-    ]
-  );
-
-  incident.id = result.lastID;
-  return incident;
-}
-
-async function updateIncidentRecord(incident) {
-  await db.run(
-    `UPDATE incidents
-     SET riskScore = ?,
-         severity = ?,
-         action = ?,
-         status = ?,
-         ip = ?,
-         amount = ?,
-         reasonCodes = ?,
-         correlationLabel = ?,
-         trendLabel = ?,
-         hitCount = ?,
-         merged = ?,
-         lastSeenAt = ?
-     WHERE id = ?`,
-    [
-      incident.riskScore,
-      incident.severity,
-      incident.action,
-      incident.status,
-      incident.ip,
-      incident.amount,
-      JSON.stringify(incident.reasonCodes),
-      incident.correlationLabel,
-      incident.trendLabel,
-      incident.hitCount,
-      incident.merged ? 1 : 0,
-      incident.lastSeenAt,
-      incident.id
-    ]
-  );
-
-  return incident;
-}
-
-async function persistAction(action) {
-  const result = await db.run(
-    `INSERT INTO actions (incidentId, action, reason, createdAt)
-     VALUES (?, ?, ?, ?)`,
-    [action.incidentId, action.action, action.reason, action.createdAt]
-  );
-
-  action.id = result.lastID;
-  return action;
-}
-
-function resortIncidentStore() {
-  incidentStore.sort((a, b) => {
-    const sevDiff = severityRank(b.severity) - severityRank(a.severity);
-    if (sevDiff !== 0) return sevDiff;
-    return new Date(b.lastSeenAt || b.createdAt).getTime() - new Date(a.lastSeenAt || a.createdAt).getTime();
-  });
-
-  if (incidentStore.length > 100) incidentStore.length = 100;
-}
-
-function summarizeSignalCounts(incidents) {
-  const counts = new Map();
-
-  for (const incident of incidents) {
-    for (const code of incident.reasonCodes || []) {
-      counts.set(code, (counts.get(code) || 0) + 1);
-    }
-    if (incident.correlationLabel && incident.correlationLabel !== "none") {
-      counts.set(incident.correlationLabel, (counts.get(incident.correlationLabel) || 0) + 1);
-    }
-    if (incident.trendLabel && incident.trendLabel !== "normal") {
-      counts.set(`trend:${incident.trendLabel}`, (counts.get(`trend:${incident.trendLabel}`) || 0) + 1);
-    }
-  }
-
-  return [...counts.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 5)
-    .map(([signal, count]) => ({ signal, count }));
-}
-
-function buildRiskTimeline() {
-  return incidentStore
-    .slice(0, 10)
-    .map((i) => ({
-      id: i.id,
-      label: `${i.type}:${i.user}`.slice(0, 18),
-      riskScore: i.riskScore,
-      severity: i.severity
-    }))
-    .reverse();
-}
-
-function buildInsightPayload() {
-  const recentIncidents = incidentStore.slice(0, 8);
-  const recentActions = actionStore.slice(0, 8);
-  const criticalCount = recentIncidents.filter((i) => i.severity === "critical").length;
-  const highCount = recentIncidents.filter((i) => i.severity === "high").length;
-  const mergedHot = recentIncidents.filter((i) => safeNum(i.hitCount, 1) >= 3).length;
-  const blockCount = recentActions.filter((a) => a.action === "block").length;
-  const reviewCount = recentActions.filter((a) => a.action === "manual_review").length;
-  const rateLimitCount = recentActions.filter((a) => a.action === "rate_limit").length;
-  const lead = recentIncidents[0];
-
-  let summary = "System posture is stable. No dominant repeated attack chain is currently controlling the board.";
-  let whatChanged = "No meaningful escalation has displaced the current baseline.";
-  let whyItMatters = "The decision engine is seeing routine noise rather than coordinated hostile behavior.";
-  let recommendedNextAction = "monitor";
-
-  if (lead?.correlationLabel === "multi_signal_attack") {
-    summary = "Correlated hostile login behavior is active. The engine is linking repeated signals into a probable account abuse pattern.";
-    whatChanged = "Velocity spikes and unseen IP activity aligned into a multi-signal attack chain.";
-    whyItMatters = "This pattern points to account compromise risk rather than harmless login noise.";
-    recommendedNextAction = "block";
-  } else if (lead?.correlationLabel === "payment_takeover_pattern") {
-    summary = "Payment-side risk is elevated. High-value activity and environmental mismatch suggest takeover pressure.";
-    whatChanged = "Suspicious payment behavior clustered with elevated transaction risk.";
-    whyItMatters = "Financial abuse can move from anomaly to loss very fast once this pattern appears.";
-    recommendedNextAction = "block";
-  } else if (criticalCount >= 2 && mergedHot >= 1) {
-    summary = "Correlated hostile activity is persisting across repeated hits. Merged incidents show the same chain is still alive.";
-    whatChanged = "Repeated high-severity events continued hitting the same attack fingerprints.";
-    whyItMatters = "Persistence matters more than a single spike. A living pattern usually means an active adversary or broken control.";
-    recommendedNextAction = "block";
-  } else if (criticalCount >= 1 || blockCount >= 1) {
-    summary = "High-risk activity remains active on the board. Immediate containment posture is justified.";
-    whatChanged = "At least one critical incident crossed the decision threshold and triggered strong action.";
-    whyItMatters = "Once the engine is blocking traffic, you are past observation and into containment.";
-    recommendedNextAction = "manual_review";
-  } else if (highCount >= 2 || reviewCount >= 2) {
-    summary = "Risk is climbing across several incidents. The board is not in crisis, but it is no longer quiet.";
-    whatChanged = "Multiple high-risk cases accumulated within the recent window.";
-    whyItMatters = "Clusters of high-risk signals often precede critical incidents if left untreated.";
-    recommendedNextAction = "manual_review";
-  } else if (rateLimitCount >= 1) {
-    summary = "Traffic pressure is elevated. The engine is seeing noisy behavior but not full compromise.";
-    whatChanged = "Spike or surge conditions caused rate limiting to enter the action stream.";
-    whyItMatters = "Pressure events can be the prelude to broader abuse, especially if they repeat.";
-    recommendedNextAction = "rate_limit";
-  }
-
+function parseIncidentRow(row) {
   return {
-    ok: true,
-    level: 7,
-    summary,
-    whatChanged,
-    whyItMatters,
-    recommendedNextAction,
-    topSignals: summarizeSignalCounts(recentIncidents),
-    metrics: {
-      criticalCount,
-      highCount,
-      mergedHot,
-      blockCount,
-      reviewCount,
-      rateLimitCount,
-      openIncidents: incidentStore.length
+    ...row,
+    geoMismatch: Boolean(row.geoMismatch),
+    velocitySpike: Boolean(row.velocitySpike),
+    reasonCodes: row.reasonCodes ? JSON.parse(row.reasonCodes) : []
+  };
+}
+
+function parseEventRow(row) {
+  return {
+    ...row,
+    geoMismatch: Boolean(row.geoMismatch),
+    velocitySpike: Boolean(row.velocitySpike)
+  };
+}
+
+async function hydrateStores() {
+  const dbEvents = await db.all(`SELECT * FROM events ORDER BY id DESC LIMIT 500`);
+  const dbIncidents = await db.all(`SELECT * FROM incidents ORDER BY id DESC LIMIT 100`);
+  const dbActions = await db.all(`SELECT * FROM actions ORDER BY id DESC LIMIT 100`);
+
+  resetArray(eventStore, dbEvents.map(parseEventRow));
+  resetArray(incidentStore, dbIncidents.map(parseIncidentRow));
+  resetArray(actionStore, dbActions);
+}
+
+function buildSummary() {
+  return {
+    totals: {
+      incidents: incidentStore.length,
+      actions: actionStore.length,
+      events: eventStore.length
     },
-    riskTimeline: buildRiskTimeline(),
-    leadIncident: lead || null
+    severity: countBy(incidentStore, "severity", ["critical", "high", "medium", "low"]),
+    actions: countBy(actionStore, "action", ["block", "manual_review", "rate_limit", "allow"]),
+    trends: countBy(incidentStore, "trendLabel", ["spike", "elevated", "normal"]),
+    correlations: countBy(incidentStore, "correlationLabel", ["critical_chain", "multi_signal", "none"]),
+    latest: {
+      incident: incidentStore[0] || null,
+      action: actionStore[0] || null
+    }
   };
 }
 
-function getIncidentById(id) {
-  return incidentStore.find((i) => String(i.id) === String(id)) || null;
-}
+wss.on("connection", (socket) => {
+  socket.send(JSON.stringify({
+    type: "bootstrap",
+    incidents: incidentStore,
+    actions: actionStore,
+    summary: buildSummary()
+  }));
+});
 
-function buildIncidentDetail(id) {
-  const incident = getIncidentById(id);
-  if (!incident) return null;
-
-  const relatedEvents = eventStore
-    .filter((e) => e.user === incident.user)
-    .slice(0, 12);
-
-  const relatedActions = actionStore
-    .filter((a) => String(a.incidentId) === String(incident.id))
-    .slice(0, 12);
-
-  return {
-    incident,
-    relatedEvents,
-    relatedActions
-  };
-}
-
-app.get("/health", (req, res) => {
-  res.json({ ok: true, service: "SignalDesk", ws: true, time: nowIso(), level: 7 });
+app.get("/health", (_req, res) => {
+  const healthOk = !isShuttingDown && !!db;
+  res.status(healthOk ? 200 : 503).json({
+    ok: healthOk,
+    service: "SignalDesk",
+    phase: "D5",
+    env: NODE_ENV,
+    incidents: incidentStore.length,
+    actions: actionStore.length,
+    events: eventStore.length,
+    ws: true,
+    db: path.basename(DB_FILE),
+    shuttingDown: isShuttingDown
+  });
 });
 
 app.get("/api/incidents", (req, res) => {
-  res.json(incidentStore);
+  const incidents = applyIncidentFilters(incidentStore, req.query);
+  res.json({ ok: true, count: incidents.length, filters: req.query, incidents });
 });
 
 app.get("/api/actions", (req, res) => {
-  res.json(actionStore);
+  const actions = applyActionFilters(actionStore, req.query);
+  res.json({ ok: true, count: actions.length, filters: req.query, actions });
 });
 
-app.get("/api/summary", (req, res) => {
-  res.json(buildInsightPayload());
-});
-
-app.get("/api/incidents/:id", (req, res) => {
-  const detail = buildIncidentDetail(req.params.id);
-  if (!detail) {
-    return res.status(404).json({ ok: false, error: "Incident not found" });
-  }
-  res.json({ ok: true, ...detail });
-});
-
-app.post("/api/incidents/:id/status", async (req, res) => {
-  try {
-    const incident = getIncidentById(req.params.id);
-    if (!incident) {
-      return res.status(404).json({ ok: false, error: "Incident not found" });
-    }
-
-    const nextStatus = req.body.status;
-    if (!["pending_review", "active_threat", "acknowledged", "resolved", "closed"].includes(nextStatus)) {
-      return res.status(400).json({ ok: false, error: "Invalid status" });
-    }
-
-    incident.status = nextStatus;
-    incident.lastSeenAt = nowIso();
-
-    await updateIncidentRecord(incident);
-
-    const actionRecord = {
-      incidentId: incident.id,
-      action: nextStatus === "resolved" || nextStatus === "closed" ? "resolve" : "acknowledge",
-      reason: `status:${nextStatus}`,
-      createdAt: nowIso()
-    };
-
-    await persistAction(actionRecord);
-    actionStore.unshift(actionRecord);
-    if (actionStore.length > 100) actionStore.length = 100;
-
-    broadcast("incident_updated", incident);
-    broadcast("action", actionRecord);
-    broadcast("summary", buildInsightPayload());
-
-    res.json({ ok: true, incident, action: actionRecord });
-  } catch (error) {
-    console.error("POST /api/incidents/:id/status failed:", error);
-    res.status(500).json({ ok: false, error: error.message });
-  }
+app.get("/api/summary", (_req, res) => {
+  res.json({ ok: true, ...buildSummary() });
 });
 
 app.post("/event", async (req, res) => {
   try {
-    const event = {
-      type: req.body.type || "unknown",
-      user: req.body.user || "anonymous",
-      attempts: safeNum(req.body.attempts, 0),
-      amount: safeNum(req.body.amount, 0),
-      ip: req.body.ip || "unknown",
-      risk: safeNum(req.body.risk, 0),
-      geoMismatch: !!req.body.geoMismatch,
-      velocitySpike: !!req.body.velocitySpike,
-      createdAt: nowIso()
-    };
-
-    eventStore.unshift(event);
-    if (eventStore.length > 250) eventStore.length = 250;
-
-    await persistEvent(event);
-
-    const recentUserEvents = rememberUserEvent(event);
-    const trendLabel = updateTrend(event);
-    const { correlationLabel, reasonCodes } = detectCorrelation(event, recentUserEvents);
-    const riskScore = buildRiskScore(event, correlationLabel, trendLabel, recentUserEvents);
-    const severity = getSeverity(riskScore);
-    const action = getRecommendedAction(riskScore, correlationLabel, trendLabel);
-    const fingerprint = computeFingerprint(event);
-
-    let incidentCreated = false;
-    let incidentMerged = false;
-    let incident = null;
-    let actionRecord = null;
-
-    if (shouldCreateOrMergeIncident(event, riskScore, correlationLabel, trendLabel)) {
-      const existing = findOpenIncidentByFingerprint(fingerprint);
-
-      if (existing) {
-        existing.hitCount = safeNum(existing.hitCount, 1) + 1;
-        existing.merged = true;
-        existing.lastSeenAt = nowIso();
-        existing.riskScore = Math.max(safeNum(existing.riskScore, 0), riskScore);
-        existing.severity = pickHigherSeverity(existing.severity || "low", severity);
-        existing.action = strongerAction(existing.action || "log", action);
-        existing.reasonCodes = uniq([...(existing.reasonCodes || []), ...reasonCodes]);
-
-        if (existing.correlationLabel === "none" && correlationLabel !== "none") {
-          existing.correlationLabel = correlationLabel;
-        }
-
-        if (trendLabel === "surge") {
-          existing.trendLabel = "surge";
-        } else if (!existing.trendLabel) {
-          existing.trendLabel = trendLabel;
-        }
-
-        existing.amount = Math.max(safeNum(existing.amount, 0), safeNum(event.amount, 0));
-        existing.ip = event.ip || existing.ip;
-        existing.status = severityRank(existing.severity) >= 4 ? "active_threat" : "pending_review";
-
-        await updateIncidentRecord(existing);
-        resortIncidentStore();
-
-        incident = existing;
-        incidentMerged = true;
-        broadcast("incident_updated", incident);
-
-        if (shouldCreateAction(existing.id, existing.action)) {
-          actionRecord = {
-            incidentId: existing.id,
-            action: existing.action,
-            reason: "merged_repeat_signal",
-            createdAt: nowIso()
-          };
-
-          await persistAction(actionRecord);
-          actionStore.unshift(actionRecord);
-          if (actionStore.length > 100) actionStore.length = 100;
-          broadcast("action", actionRecord);
-        }
-      } else {
-        incident = {
-          type: event.type,
-          user: event.user,
-          riskScore,
-          severity,
-          action,
-          status: severity === "critical" ? "active_threat" : "pending_review",
-          ip: event.ip,
-          amount: event.amount,
-          reasonCodes,
-          correlationLabel,
-          trendLabel,
-          fingerprint,
-          hitCount: 1,
-          merged: false,
-          firstSeenAt: event.createdAt,
-          lastSeenAt: event.createdAt,
-          createdAt: event.createdAt
-        };
-
-        await createIncidentRecord(incident);
-        incidentStore.unshift(incident);
-        resortIncidentStore();
-
-        incidentCreated = true;
-        broadcast("incident", incident);
-
-        if (shouldCreateAction(incident.id, incident.action)) {
-          actionRecord = {
-            incidentId: incident.id,
-            action: incident.action,
-            reason:
-              correlationLabel !== "none"
-                ? correlationLabel
-                : trendLabel !== "normal"
-                  ? trendLabel
-                  : severity,
-            createdAt: nowIso()
-          };
-
-          await persistAction(actionRecord);
-          actionStore.unshift(actionRecord);
-          if (actionStore.length > 100) actionStore.length = 100;
-          broadcast("action", actionRecord);
-        }
-      }
+    if (isShuttingDown) {
+      return res.status(503).json({ ok: false, error: "Service is shutting down" });
     }
 
-    const insightPayload = buildInsightPayload();
-    broadcast("summary", insightPayload);
+    const normalized = normalizeEvent(req.body);
+    const trend = detectTrendAnomaly(normalized);
+    const correlation = detectCorrelation(normalized);
+    const riskResult = calculateRiskScore(normalized, trend, correlation);
 
-    broadcast("event", {
-      ...event,
-      riskScore,
-      severity,
-      correlationLabel,
-      trendLabel,
-      action,
-      fingerprint
+    const decision = decideAction(riskResult.score, {
+      trendLabel: trend.label,
+      correlationLabel: correlation.label
     });
 
-    res.json({
-      ok: true,
-      event,
-      incidentCreated,
-      incidentMerged,
+    const eventInsert = await db.run(
+      `INSERT INTO events (type, user, amount, risk, attempts, ip, geoMismatch, velocitySpike, timestamp)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        normalized.type,
+        normalized.user,
+        normalized.amount,
+        normalized.risk,
+        normalized.attempts,
+        normalized.ip,
+        normalized.geoMismatch ? 1 : 0,
+        normalized.velocitySpike ? 1 : 0,
+        normalized.timestamp
+      ]
+    );
+
+    const incidentDraft = createIncident(
+      normalized,
+      riskResult.score,
+      decision,
+      trend,
+      correlation,
+      riskResult.reasonCodes
+    );
+
+    const incidentInsert = await db.run(
+      `INSERT INTO incidents (
+        type, user, amount, ip, risk, riskScore, severity, action, status, reason,
+        reasonCodes, trendLabel, correlationLabel, geoMismatch, velocitySpike, attempts, createdAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        incidentDraft.type,
+        incidentDraft.user,
+        incidentDraft.amount,
+        incidentDraft.ip,
+        incidentDraft.risk,
+        incidentDraft.riskScore,
+        incidentDraft.severity,
+        incidentDraft.action,
+        incidentDraft.status,
+        incidentDraft.reason,
+        JSON.stringify(incidentDraft.reasonCodes),
+        incidentDraft.trendLabel,
+        incidentDraft.correlationLabel,
+        incidentDraft.geoMismatch ? 1 : 0,
+        incidentDraft.velocitySpike ? 1 : 0,
+        incidentDraft.attempts,
+        incidentDraft.createdAt
+      ]
+    );
+
+    const incident = { id: incidentInsert.lastID, ...incidentDraft };
+
+    const actionDraft = createActionLog(
+      normalized,
+      riskResult.score,
+      decision,
+      incident.id,
+      incident.trendLabel,
+      incident.correlationLabel
+    );
+
+    const actionInsert = await db.run(
+      `INSERT INTO actions (
+        incidentId, user, type, action, severity, status, reason,
+        riskScore, trendLabel, correlationLabel, createdAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        actionDraft.incidentId,
+        actionDraft.user,
+        actionDraft.type,
+        actionDraft.action,
+        actionDraft.severity,
+        actionDraft.status,
+        actionDraft.reason,
+        actionDraft.riskScore,
+        actionDraft.trendLabel,
+        actionDraft.correlationLabel,
+        actionDraft.createdAt
+      ]
+    );
+
+    const actionLog = { id: actionInsert.lastID, ...actionDraft };
+
+    eventStore.unshift({ id: eventInsert.lastID, ...normalized });
+    incidentStore.unshift(incident);
+    actionStore.unshift(actionLog);
+
+    if (eventStore.length > 500) eventStore.pop();
+    if (incidentStore.length > 100) incidentStore.pop();
+    if (actionStore.length > 100) actionStore.pop();
+
+    const summary = buildSummary();
+
+    broadcast({
+      type: "event_processed",
       incident,
-      action: actionRecord,
-      insights: insightPayload,
-      derived: {
-        riskScore,
-        severity,
-        correlationLabel,
-        trendLabel,
-        recommendedAction: action,
-        fingerprint
-      }
+      actionLog,
+      incidents: incidentStore,
+      actions: actionStore,
+      summary
     });
-  } catch (error) {
-    console.error("POST /event failed:", error);
-    res.status(500).json({ ok: false, error: error.message });
+
+    return res.json({
+      ok: true,
+      event: normalized,
+      trend,
+      correlation,
+      riskScore: riskResult.score,
+      reasonCodes: riskResult.reasonCodes,
+      decision,
+      incidentCreated: true,
+      incident,
+      actionLogged: true,
+      actionLog,
+      summary
+    });
+  } catch (err) {
+    console.error("POST /event failed:", err);
+    return res.status(400).json({
+      ok: false,
+      error: err.message || "Invalid event payload"
+    });
   }
 });
 
-const server = http.createServer(app);
-wss = new WebSocketServer({ server });
-
-wss.on("connection", (ws) => {
-  ws.send(
-    JSON.stringify({
-      type: "bootstrap",
-      payload: {
-        incidents: incidentStore.slice(0, 10),
-        actions: actionStore.slice(0, 10),
-        summary: buildInsightPayload()
-      }
-    })
-  );
+app.get("/{*any}", (_req, res) => {
+  res.sendFile(path.join(publicDir, "index.html"));
 });
 
-await initDb();
-await loadRecentStateFromDb();
+async function shutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log(`[SignalDesk] ${signal} received, shutting down gracefully...`);
 
-server.listen(PORT, () => {
-  console.log(`SignalDesk listening on http://localhost:${PORT}`);
+  wss.clients.forEach((client) => {
+    try { client.close(); } catch {}
+  });
+
+  server.close(async () => {
+    try {
+      if (db) await db.close();
+      console.log("[SignalDesk] Shutdown complete.");
+      process.exit(0);
+    } catch (err) {
+      console.error("[SignalDesk] Shutdown error:", err);
+      process.exit(1);
+    }
+  });
+
+  setTimeout(() => {
+    console.error("[SignalDesk] Forced shutdown after timeout.");
+    process.exit(1);
+  }, 10000).unref();
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+process.on("unhandledRejection", (err) => {
+  console.error("[SignalDesk] Unhandled rejection:", err);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("[SignalDesk] Uncaught exception:", err);
+});
+
+async function start() {
+  await initDb();
+  await hydrateStores();
+
+  server.listen(PORT, HOST, () => {
+    console.log(`SignalDesk Phase D5 listening on http://${HOST}:${PORT}`);
+    console.log(`Using database: ${DB_FILE}`);
+    console.log(`Environment: ${NODE_ENV}`);
+  });
+}
+
+start().catch((err) => {
+  console.error("Failed to start SignalDesk:", err);
+  process.exit(1);
 });

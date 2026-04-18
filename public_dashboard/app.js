@@ -1,556 +1,348 @@
-const wsUrl =
-  location.protocol === "https:"
-    ? `wss://${location.host}`
-    : `ws://${location.host}`;
-
 const incidentList = document.getElementById("incidentList");
 const actionList = document.getElementById("actionList");
-const summaryBox = document.getElementById("aiSummary");
-const authStatus = document.getElementById("authStatus");
-const connectionStatus = document.getElementById("connection-status");
-const liveFeed = document.getElementById("liveFeed");
-const detailPanel = document.getElementById("detailPanel");
-const severityFilter = document.getElementById("severityFilter");
-const userSearch = document.getElementById("userSearch");
-const clearFilters = document.getElementById("clearFilters");
-const riskTimeline = document.getElementById("riskTimeline");
-const seedDemo = document.getElementById("seedDemo");
+const incidentCount = document.getElementById("incidentCount");
+const actionCount = document.getElementById("actionCount");
+const engineState = document.getElementById("engineState");
+const engineMeta = document.getElementById("engineMeta");
+const phaseLabel = document.getElementById("phaseLabel");
+const refreshBtn = document.getElementById("refreshBtn");
+const decisionState = document.getElementById("decisionState");
+const decisionMeta = document.getElementById("decisionMeta");
+const socketStatus = document.getElementById("socketStatus");
+const liveDot = document.getElementById("liveDot");
 
-let allIncidents = [];
-let allActions = [];
-let selectedIncidentId = null;
-let summaryState = null;
-let ws;
-let reconnectTimer = null;
-let refreshTimer = null;
-let heartbeatTimer = null;
-let isRefreshing = false;
-let wsConnected = false;
-let reconnectDelay = 1500;
+const totalIncidents = document.getElementById("totalIncidents");
+const totalActions = document.getElementById("totalActions");
+const totalEvents = document.getElementById("totalEvents");
+const severitySummary = document.getElementById("severitySummary");
+const actionSummary = document.getElementById("actionSummary");
+const trendSummary = document.getElementById("trendSummary");
+const correlationSummary = document.getElementById("correlationSummary");
+const latestIncidentSummary = document.getElementById("latestIncidentSummary");
+const latestActionSummary = document.getElementById("latestActionSummary");
 
-function esc(v) {
-  return String(v ?? "")
+function severityClass(severity) {
+  if (!severity) return "low";
+  const s = severity.toLowerCase();
+  if (s === "critical") return "critical";
+  if (s === "high") return "high";
+  if (s === "medium") return "medium";
+  return "low";
+}
+
+function trendClass(label) {
+  if (!label) return "trend-normal";
+  if (label === "spike") return "trend-spike";
+  if (label === "elevated") return "trend-elevated";
+  return "trend-normal";
+}
+
+function correlationClass(label) {
+  if (!label) return "corr-none";
+  if (label === "critical_chain") return "corr-critical_chain";
+  if (label === "multi_signal") return "corr-multi_signal";
+  return "corr-none";
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
-function setConnectionStatus(text) {
-  if (connectionStatus) connectionStatus.textContent = text;
+function formatDate(iso) {
+  try {
+    return new Date(iso).toLocaleString();
+  } catch {
+    return iso || "—";
+  }
 }
 
-function badgeClass(severity) {
-  if (severity === "critical") return "background:#8b0000;color:#fff;";
-  if (severity === "high") return "background:#b45309;color:#fff;";
-  if (severity === "medium") return "background:#1d4ed8;color:#fff;";
-  return "background:#334155;color:#fff;";
-}
-
-function actionClass(action) {
-  if (action === "block") return "background:#7f1d1d;color:#fff;";
-  if (action === "manual_review") return "background:#92400e;color:#fff;";
-  if (action === "rate_limit") return "background:#1e3a8a;color:#fff;";
-  if (action === "resolve") return "background:#14532d;color:#fff;";
-  if (action === "acknowledge") return "background:#4b5563;color:#fff;";
-  return "background:#374151;color:#fff;";
-}
-
-function severityLeftColor(severity) {
-  if (severity === "critical") return "#ef4444";
-  if (severity === "high") return "#f59e0b";
-  if (severity === "medium") return "#3b82f6";
-  return "#64748b";
-}
-
-function renderIncident(item) {
-  const hitCount = Number(item.hitCount || 1);
-  const merged = !!item.merged;
+function renderReasonCodes(reasonCodes = []) {
+  if (!reasonCodes.length) return `<div class="muted">No reason codes.</div>`;
 
   return `
-    <div data-incident-id="${esc(item.id || "")}" class="incident-card" style="cursor:pointer;border:1px solid rgba(255,255,255,0.12);border-left:4px solid ${severityLeftColor(item.severity)};border-radius:14px;padding:12px;margin-bottom:10px;background:rgba(15,23,42,.75);box-shadow:${item.severity === "critical" ? "0 0 20px rgba(239,68,68,.18)" : "none"};">
-      <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap;">
-        <strong>${esc(item.type || "unknown")} • ${esc(item.user || "anonymous")}</strong>
-        <span style="padding:4px 8px;border-radius:999px;font-size:12px;${badgeClass(item.severity)}">${esc(item.severity)}</span>
-      </div>
-
-      <div style="margin-top:8px;font-size:13px;opacity:.92;">
-        Risk Score: <strong>${esc(item.riskScore)}</strong> |
-        Action: <span style="padding:3px 8px;border-radius:999px;${actionClass(item.action)}">${esc(item.action)}</span>
-      </div>
-
-      <div style="margin-top:8px;font-size:13px;">
-        Correlation: <strong>${esc(item.correlationLabel)}</strong> |
-        Trend: <strong>${esc(item.trendLabel)}</strong>
-      </div>
-
-      <div style="margin-top:8px;font-size:13px;">
-        Hits: <strong>${esc(hitCount)}</strong> |
-        Merged: <strong>${merged ? "yes" : "no"}</strong> |
-        Status: <strong>${esc(item.status || "pending_review")}</strong>
-      </div>
-
-      <div style="margin-top:8px;font-size:12px;opacity:.85;">
-        Why: ${esc((item.reasonCodes || []).join(", ") || "No reason codes")}
-      </div>
+    <div class="reason-list">
+      ${reasonCodes.map((code) => `<span class="reason-chip">${escapeHtml(code)}</span>`).join("")}
     </div>
   `;
 }
 
-function renderAction(item) {
-  return `
-    <div style="border:1px solid rgba(255,255,255,0.10);border-radius:12px;padding:10px;margin-bottom:8px;background:rgba(2,6,23,.72);">
-      <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">
-        <strong>${esc(item.action)}</strong>
-        <span style="font-size:12px;opacity:.75;">${esc(item.createdAt || "")}</span>
-      </div>
-      <div style="font-size:13px;opacity:.9;margin-top:4px;">
-        Reason: ${esc(item.reason || "n/a")}
-      </div>
-      <div style="font-size:12px;opacity:.7;margin-top:4px;">
-        Incident ID: ${esc(item.incidentId || "-")}
-      </div>
-    </div>
-  `;
-}
-
-function renderFeed(item) {
-  return `
-    <div style="padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.08);">
-      <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">
-        <strong>${esc(item.type)} • ${esc(item.user)}</strong>
-        <span style="padding:3px 8px;border-radius:999px;${badgeClass(item.severity)}">${esc(item.severity)}</span>
-      </div>
-      <div style="font-size:13px;opacity:.9;margin-top:4px;">
-        riskScore=${esc(item.riskScore)} | trend=${esc(item.trendLabel)} | correlation=${esc(item.correlationLabel)} | action=${esc(item.action)}
-      </div>
-      <div style="font-size:12px;opacity:.75;margin-top:4px;">
-        fingerprint=${esc(item.fingerprint || "-")}
-      </div>
-    </div>
-  `;
-}
-
-function renderSignals(signals) {
-  if (!signals || !signals.length) return "<div class='muted'>No dominant signals.</div>";
-  return signals
-    .map(
-      (s) => `
-        <div style="display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.06);">
-          <span>${esc(s.signal)}</span>
-          <strong>${esc(s.count)}</strong>
-        </div>
-      `
-    )
-    .join("");
-}
-
-function renderTimeline(items) {
-  if (!riskTimeline) return;
-  if (!items || !items.length) {
-    riskTimeline.innerHTML = "<div class='muted'>No recent incidents yet.</div>";
+function renderSummaryBlock(container, entries) {
+  if (!entries.length) {
+    container.innerHTML = `<div class="muted">No data.</div>`;
     return;
   }
 
-  riskTimeline.innerHTML = `
-    <div class="timeline">
-      ${items.map((item) => {
-        const h = Math.max(16, Number(item.riskScore || 0));
-        const color =
-          item.severity === "critical" ? "#ef4444" :
-          item.severity === "high" ? "#f59e0b" :
-          item.severity === "medium" ? "#3b82f6" : "#64748b";
-        return `
-          <div class="barwrap">
-            <div class="barvalue">${esc(item.riskScore)}</div>
-            <div class="bar" style="height:${h}px;background:${color};"></div>
-            <div class="barlabel">${esc(item.label)}</div>
-          </div>
-        `;
-      }).join("")}
+  container.innerHTML = entries.map(([label, value]) => `
+    <div class="summary-line">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value)}</strong>
     </div>
-  `;
+  `).join("");
 }
 
-function renderSummaryPanel(data) {
-  summaryState = data;
-  if (!summaryBox) return;
-
-  summaryBox.innerHTML = `
-    <div style="display:grid;gap:10px;">
-      <div>
-        <div style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;opacity:.6;">Summary</div>
-        <div style="margin-top:4px;font-size:15px;line-height:1.5;">${esc(data.summary || "No summary available.")}</div>
-      </div>
-
-      <div>
-        <div style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;opacity:.6;">What changed</div>
-        <div style="margin-top:4px;font-size:14px;line-height:1.45;">${esc(data.whatChanged || "-")}</div>
-      </div>
-
-      <div>
-        <div style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;opacity:.6;">Why it matters</div>
-        <div style="margin-top:4px;font-size:14px;line-height:1.45;">${esc(data.whyItMatters || "-")}</div>
-      </div>
-
-      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
-        <span style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;opacity:.6;">Recommended next action</span>
-        <span style="padding:4px 10px;border-radius:999px;${actionClass(data.recommendedNextAction || "log")}">${esc(data.recommendedNextAction || "monitor")}</span>
-      </div>
-
-      <div>
-        <div style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;opacity:.6;">Top signals</div>
-        <div style="margin-top:6px;">${renderSignals(data.topSignals)}</div>
-      </div>
-
-      <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:4px;">
-        <div style="padding:8px;border:1px solid rgba(255,255,255,.08);border-radius:10px;">
-          <div style="font-size:11px;opacity:.6;">Critical</div>
-          <div style="font-size:18px;font-weight:700;">${esc(data.metrics?.criticalCount ?? 0)}</div>
-        </div>
-        <div style="padding:8px;border:1px solid rgba(255,255,255,.08);border-radius:10px;">
-          <div style="font-size:11px;opacity:.6;">Blocks</div>
-          <div style="font-size:18px;font-weight:700;">${esc(data.metrics?.blockCount ?? 0)}</div>
-        </div>
-        <div style="padding:8px;border:1px solid rgba(255,255,255,.08);border-radius:10px;">
-          <div style="font-size:11px;opacity:.6;">Merged hot</div>
-          <div style="font-size:18px;font-weight:700;">${esc(data.metrics?.mergedHot ?? 0)}</div>
-        </div>
-        <div style="padding:8px;border:1px solid rgba(255,255,255,.08);border-radius:10px;">
-          <div style="font-size:11px;opacity:.6;">Open</div>
-          <div style="font-size:18px;font-weight:700;">${esc(data.metrics?.openIncidents ?? 0)}</div>
-        </div>
-      </div>
-    </div>
-  `;
-
-  renderTimeline(data.riskTimeline || []);
-}
-
-function getFilteredIncidents() {
-  const sev = severityFilter?.value || "all";
-  const user = (userSearch?.value || "").trim().toLowerCase();
-
-  return allIncidents.filter((i) => {
-    if (sev !== "all" && i.severity !== sev) return false;
-    if (user && !String(i.user || "").toLowerCase().includes(user)) return false;
-    return true;
-  });
-}
-
-function renderIncidentList() {
-  if (!incidentList) return;
-  const filtered = getFilteredIncidents();
-  incidentList.innerHTML = filtered.length
-    ? filtered.map(renderIncident).join("")
-    : "<div class='muted'>No incidents match current filters.</div>";
-
-  bindIncidentClicks();
-}
-
-function renderActionList() {
-  if (!actionList) return;
-  actionList.innerHTML = allActions.slice(0, 20).map(renderAction).join("");
-}
-
-async function fetchJsonWithRetry(url, options = {}, tries = 4, delay = 600) {
-  let lastError;
-  for (let i = 0; i < tries; i++) {
-    try {
-      const res = await fetch(url, options);
-      if (!res.ok) throw new Error(`${url} returned ${res.status}`);
-      return await res.json();
-    } catch (err) {
-      lastError = err;
-      await new Promise((resolve) => setTimeout(resolve, delay));
-    }
+function renderLatestBox(container, item, type) {
+  if (!item) {
+    container.innerHTML = `<div class="muted">No recent ${escapeHtml(type)}.</div>`;
+    return;
   }
-  throw lastError;
+
+  const lines = type === "incident"
+    ? [
+        ["type", item.type],
+        ["user", item.user],
+        ["action", item.action],
+        ["risk", item.riskScore],
+        ["time", formatDate(item.createdAt)]
+      ]
+    : [
+        ["type", item.type],
+        ["user", item.user],
+        ["action", item.action],
+        ["severity", item.severity],
+        ["time", formatDate(item.createdAt)]
+      ];
+
+  renderSummaryBlock(container, lines);
 }
 
-async function loadDetail(id) {
-  selectedIncidentId = id;
-  if (!detailPanel) return;
-  detailPanel.innerHTML = "Loading incident detail...";
+function renderIncidents(items) {
+  incidentCount.textContent = String(items.length);
 
-  try {
-    const data = await fetchJsonWithRetry(`/api/incidents/${id}`);
-
-    if (!data.ok) {
-      detailPanel.innerHTML = `<div class="muted">${esc(data.error || "Detail not available.")}</div>`;
-      return;
-    }
-
-    const incident = data.incident;
-    const relatedEvents = data.relatedEvents || [];
-    const relatedActions = data.relatedActions || [];
-
-    detailPanel.innerHTML = `
-      <div style="display:grid;gap:10px;">
-        <div>
-          <div style="font-size:18px;font-weight:700;">${esc(incident.type)} • ${esc(incident.user)}</div>
-          <div class="muted" style="margin-top:4px;">Incident ID ${esc(incident.id)} | fingerprint ${esc(incident.fingerprint)}</div>
-        </div>
-
-        <div style="display:flex;gap:8px;flex-wrap:wrap;">
-          <span style="padding:4px 10px;border-radius:999px;${badgeClass(incident.severity)}">${esc(incident.severity)}</span>
-          <span style="padding:4px 10px;border-radius:999px;${actionClass(incident.action)}">${esc(incident.action)}</span>
-          <span class="muted">status=${esc(incident.status)}</span>
-        </div>
-
-        <div>
-          <div style="font-size:13px;line-height:1.5;">
-            riskScore=<strong>${esc(incident.riskScore)}</strong> |
-            hits=<strong>${esc(incident.hitCount)}</strong> |
-            merged=<strong>${esc(incident.merged ? "yes" : "no")}</strong>
-          </div>
-          <div style="font-size:13px;line-height:1.5;margin-top:4px;">
-            correlation=<strong>${esc(incident.correlationLabel)}</strong> |
-            trend=<strong>${esc(incident.trendLabel)}</strong>
-          </div>
-        </div>
-
-        <div>
-          <div style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;opacity:.6;">Reason codes</div>
-          <div style="margin-top:6px;">${esc((incident.reasonCodes || []).join(", ") || "none")}</div>
-        </div>
-
-        <div class="btnrow">
-          <button data-status="acknowledged">Acknowledge</button>
-          <button data-status="resolved">Resolve</button>
-          <button data-status="pending_review">Re-open</button>
-        </div>
-
-        <div>
-          <div style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;opacity:.6;">Related events</div>
-          <div style="margin-top:8px;display:grid;gap:8px;">
-            ${relatedEvents.map((e) => `
-              <div style="border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:8px;">
-                <div><strong>${esc(e.type)}</strong> • ${esc(e.user)}</div>
-                <div class="muted">risk=${esc(e.risk)} amount=${esc(e.amount)} ip=${esc(e.ip)} createdAt=${esc(e.createdAt)}</div>
-              </div>
-            `).join("") || "<div class='muted'>No related events.</div>"}
-          </div>
-        </div>
-
-        <div>
-          <div style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;opacity:.6;">Related actions</div>
-          <div style="margin-top:8px;display:grid;gap:8px;">
-            ${relatedActions.map((a) => `
-              <div style="border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:8px;">
-                <div><strong>${esc(a.action)}</strong></div>
-                <div class="muted">reason=${esc(a.reason)} createdAt=${esc(a.createdAt)}</div>
-              </div>
-            `).join("") || "<div class='muted'>No related actions.</div>"}
-          </div>
-        </div>
+  if (!items.length) {
+    incidentList.innerHTML = `
+      <div class="empty">
+        No incidents yet. Post to <code>/event</code> and they will appear here live.
       </div>
     `;
-
-    detailPanel.querySelectorAll("[data-status]").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        await updateIncidentStatus(id, btn.getAttribute("data-status"));
-      });
-    });
-  } catch (err) {
-    console.error(err);
-    detailPanel.innerHTML = "<div class='muted'>Failed to load detail.</div>";
+    return;
   }
+
+  incidentList.innerHTML = items.map((item) => `
+    <div class="incident">
+      <div class="incident-top">
+        <div class="incident-title">
+          ${escapeHtml(item.type)} · ${escapeHtml(item.user)}
+        </div>
+        <div class="badges">
+          <span class="badge ${severityClass(item.severity)}">${escapeHtml(item.severity)}</span>
+          <span class="badge ${severityClass(item.severity)}">${escapeHtml(item.action)}</span>
+          <span class="badge ${severityClass(item.severity)}">risk ${escapeHtml(item.riskScore)}</span>
+        </div>
+      </div>
+
+      <div class="badges" style="margin-bottom:10px;">
+        <span class="badge ${trendClass(item.trendLabel)}">trend ${escapeHtml(item.trendLabel || "normal")}</span>
+        <span class="badge ${correlationClass(item.correlationLabel)}">correlation ${escapeHtml(item.correlationLabel || "none")}</span>
+      </div>
+
+      <div class="muted">${escapeHtml(item.reason || "No reason provided.")}</div>
+
+      <div class="row">
+        <div class="meta">
+          <span class="meta-label">Status</span>
+          <div class="meta-value">${escapeHtml(item.status)}</div>
+        </div>
+
+        <div class="meta">
+          <span class="meta-label">IP</span>
+          <div class="meta-value">${escapeHtml(item.ip)}</div>
+        </div>
+
+        <div class="meta">
+          <span class="meta-label">Created</span>
+          <div class="meta-value">${escapeHtml(formatDate(item.createdAt))}</div>
+        </div>
+
+        <div class="meta">
+          <span class="meta-label">Amount</span>
+          <div class="meta-value">${escapeHtml(item.amount)}</div>
+        </div>
+
+        <div class="meta">
+          <span class="meta-label">Attempts</span>
+          <div class="meta-value">${escapeHtml(item.attempts)}</div>
+        </div>
+
+        <div class="meta">
+          <span class="meta-label">Flags</span>
+          <div class="meta-value">
+            geoMismatch=${escapeHtml(item.geoMismatch)} · velocitySpike=${escapeHtml(item.velocitySpike)}
+          </div>
+        </div>
+      </div>
+
+      ${renderReasonCodes(item.reasonCodes || [])}
+    </div>
+  `).join("");
 }
 
-async function updateIncidentStatus(id, status) {
-  try {
-    const data = await fetchJsonWithRetry(`/api/incidents/${id}/status`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status })
-    });
+function renderActions(items) {
+  actionCount.textContent = String(items.length);
 
-    if (!data.ok) return;
-    await refreshAll(true);
-    await loadDetail(id);
-  } catch (err) {
-    console.error(err);
+  if (!items.length) {
+    actionList.innerHTML = `
+      <div class="empty">
+        No actions yet. Decisions will appear here live.
+      </div>
+    `;
+    return;
   }
+
+  actionList.innerHTML = items.map((item) => `
+    <div class="action-item">
+      <div class="action-top">
+        <div class="action-title">
+          ${escapeHtml(item.action)} · ${escapeHtml(item.user)}
+        </div>
+        <div class="badges">
+          <span class="badge ${severityClass(item.severity)}">${escapeHtml(item.severity)}</span>
+          <span class="badge ${severityClass(item.severity)}">${escapeHtml(item.type)}</span>
+          <span class="badge ${severityClass(item.severity)}">risk ${escapeHtml(item.riskScore)}</span>
+        </div>
+      </div>
+
+      <div class="badges" style="margin-bottom:10px;">
+        <span class="badge ${trendClass(item.trendLabel)}">trend ${escapeHtml(item.trendLabel || "normal")}</span>
+        <span class="badge ${correlationClass(item.correlationLabel)}">correlation ${escapeHtml(item.correlationLabel || "none")}</span>
+      </div>
+
+      <div class="muted">${escapeHtml(item.reason || "No reason provided.")}</div>
+
+      <div class="row">
+        <div class="meta">
+          <span class="meta-label">Status</span>
+          <div class="meta-value">${escapeHtml(item.status)}</div>
+        </div>
+
+        <div class="meta">
+          <span class="meta-label">Incident ID</span>
+          <div class="meta-value">${escapeHtml(item.incidentId)}</div>
+        </div>
+
+        <div class="meta">
+          <span class="meta-label">Created</span>
+          <div class="meta-value">${escapeHtml(formatDate(item.createdAt))}</div>
+        </div>
+      </div>
+    </div>
+  `).join("");
 }
 
-function bindIncidentClicks() {
-  document.querySelectorAll(".incident-card").forEach((el) => {
-    el.addEventListener("click", () => {
-      const id = el.getAttribute("data-incident-id");
-      if (id) loadDetail(id);
-    });
+function updateDecisionPosture(incidents, actions) {
+  if (!incidents.length && !actions.length) {
+    decisionState.textContent = "Monitoring";
+    decisionMeta.textContent = "No recent actions. Engine is waiting for new events.";
+    return;
+  }
+
+  const latestAction = actions[0];
+  if (!latestAction) {
+    decisionState.textContent = "Tracking";
+    decisionMeta.textContent = "Incidents exist, but no action feed is available yet.";
+    return;
+  }
+
+  decisionState.textContent = latestAction.action;
+  decisionMeta.textContent =
+    `Latest action: ${latestAction.action} on ${latestAction.type} for ${latestAction.user} ` +
+    `with risk ${latestAction.riskScore}, trend ${latestAction.trendLabel || "normal"}, ` +
+    `correlation ${latestAction.correlationLabel || "none"}.`;
+}
+
+function renderSummary(summary) {
+  totalIncidents.textContent = String(summary?.totals?.incidents ?? 0);
+  totalActions.textContent = String(summary?.totals?.actions ?? 0);
+  totalEvents.textContent = String(summary?.totals?.events ?? 0);
+
+  renderSummaryBlock(severitySummary, Object.entries(summary?.severity || {}));
+  renderSummaryBlock(actionSummary, Object.entries(summary?.actions || {}));
+  renderSummaryBlock(trendSummary, Object.entries(summary?.trends || {}));
+  renderSummaryBlock(correlationSummary, Object.entries(summary?.correlations || {}));
+  renderLatestBox(latestIncidentSummary, summary?.latest?.incident || null, "incident");
+  renderLatestBox(latestActionSummary, summary?.latest?.action || null, "action");
+}
+
+function renderAll(incidents, actions, summary = null) {
+  renderIncidents(incidents || []);
+  renderActions(actions || []);
+  updateDecisionPosture(incidents || [], actions || []);
+  if (summary) renderSummary(summary);
+  engineState.textContent = "Running";
+  engineMeta.textContent = `Phase D4.1 · ${incidents.length} incidents · ${actions.length} actions`;
+}
+
+async function loadInitialData() {
+  const [healthRes, incidentsRes, actionsRes, summaryRes] = await Promise.all([
+    fetch("/health"),
+    fetch("/api/incidents"),
+    fetch("/api/actions"),
+    fetch("/api/summary")
+  ]);
+
+  const health = await healthRes.json();
+  const incidentData = await incidentsRes.json();
+  const actionData = await actionsRes.json();
+  const summaryData = await summaryRes.json();
+
+  phaseLabel.textContent = health.phase || "D4";
+  engineState.textContent = health.ok ? "Running" : "Stopped";
+  engineMeta.textContent = `Phase ${health.phase || "?"} · ${health.incidents ?? 0} incidents · ${health.actions ?? 0} actions`;
+  renderAll(incidentData.incidents || [], actionData.actions || [], summaryData);
+}
+
+function connectSocket() {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${protocol}//${window.location.host}`);
+
+  ws.addEventListener("open", () => {
+    socketStatus.textContent = "socket live";
+    liveDot.classList.add("on");
+  });
+
+  ws.addEventListener("close", () => {
+    socketStatus.textContent = "socket offline";
+    liveDot.classList.remove("on");
+    setTimeout(connectSocket, 1500);
+  });
+
+  ws.addEventListener("message", (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+
+      if (payload.type === "bootstrap") {
+        renderAll(payload.incidents || [], payload.actions || []);
+        return;
+      }
+
+      if (payload.type === "event_processed") {
+        renderAll(payload.incidents || [], payload.actions || [], payload.summary || null);
+      }
+    } catch (err) {
+      console.error("WebSocket parse error:", err);
+    }
+  });
+
+  ws.addEventListener("error", () => {
+    socketStatus.textContent = "socket error";
+    liveDot.classList.remove("on");
   });
 }
 
-function prepend(container, html, max = 10) {
-  if (!container) return;
-  container.insertAdjacentHTML("afterbegin", html);
-  while (container.children.length > max) {
-    container.removeChild(container.lastElementChild);
-  }
-}
-
-async function refreshAll(force = false) {
-  if (isRefreshing && !force) return;
-  isRefreshing = true;
-
-  try {
-    const [incidents, actions, summary] = await Promise.all([
-      fetchJsonWithRetry("/api/incidents"),
-      fetchJsonWithRetry("/api/actions"),
-      fetchJsonWithRetry("/api/summary")
-    ]);
-
-    allIncidents = incidents;
-    allActions = actions;
-
-    renderIncidentList();
-    renderActionList();
-    renderSummaryPanel(summary);
-
-    if (!wsConnected) {
-      setConnectionStatus("HTTP sync active");
-    }
-  } catch (err) {
-    console.error("refreshAll failed:", err);
-    if (!summaryState && summaryBox) {
-      summaryBox.innerHTML = "<div class='muted'>Failed to load summary. Retrying…</div>";
-    }
-  } finally {
-    isRefreshing = false;
-  }
-}
-
-async function seedDemoEvents() {
-  const events = [
-    { type: "login", user: "demo-user", attempts: 6, ip: "unknown", risk: 74, velocitySpike: true },
-    { type: "login", user: "demo-user", attempts: 7, ip: "unknown", risk: 82, velocitySpike: true },
-    { type: "payment", user: "demo-user", amount: 9000, ip: "unknown", risk: 86, geoMismatch: true }
-  ];
-
-  for (const event of events) {
-    await fetchJsonWithRetry("/event", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(event)
-    });
-    await new Promise((resolve) => setTimeout(resolve, 600));
-  }
-}
-
-function startRefreshLoop() {
-  if (refreshTimer) clearInterval(refreshTimer);
-  refreshTimer = setInterval(() => {
-    refreshAll();
-  }, 8000);
-}
-
-function startHeartbeat() {
-  if (heartbeatTimer) clearInterval(heartbeatTimer);
-  heartbeatTimer = setInterval(async () => {
-    if (!wsConnected) {
-      await refreshAll();
-    }
-  }, 5000);
-}
-
-function scheduleReconnect() {
-  if (reconnectTimer) return;
-  setConnectionStatus("WS reconnecting...");
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connectWs();
-  }, reconnectDelay);
-  reconnectDelay = Math.min(reconnectDelay * 1.5, 8000);
-}
-
-function connectWs() {
-  try {
-    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-      return;
-    }
-
-    ws = new WebSocket(wsUrl);
-    setConnectionStatus("WS connecting...");
-
-    ws.onopen = async () => {
-      wsConnected = true;
-      reconnectDelay = 1500;
-      setConnectionStatus("WS connected");
-      await refreshAll(true);
-    };
-
-    ws.onclose = () => {
-      wsConnected = false;
-      setConnectionStatus("WS disconnected");
-      scheduleReconnect();
-    };
-
-    ws.onerror = () => {
-      wsConnected = false;
-      setConnectionStatus("WS error");
-      try { ws.close(); } catch {}
-    };
-
-    ws.onmessage = async (msg) => {
-      try {
-        const data = JSON.parse(msg.data);
-
-        if (data.type === "bootstrap") {
-          allIncidents = data.payload?.incidents || [];
-          allActions = data.payload?.actions || [];
-          renderIncidentList();
-          renderActionList();
-          if (data.payload?.summary) renderSummaryPanel(data.payload.summary);
-          return;
-        }
-
-        if (data.type === "event" && liveFeed) {
-          prepend(liveFeed, renderFeed(data.payload), 14);
-        }
-
-        if (data.type === "incident" || data.type === "incident_updated" || data.type === "action" || data.type === "summary") {
-          await refreshAll(true);
-          if (selectedIncidentId) {
-            await loadDetail(selectedIncidentId);
-          }
-        }
-      } catch (err) {
-        console.error("WS parse error:", err);
-      }
-    };
-  } catch (err) {
-    console.error("connectWs failed:", err);
-    wsConnected = false;
-    scheduleReconnect();
-  }
-}
-
-severityFilter?.addEventListener("change", renderIncidentList);
-userSearch?.addEventListener("input", renderIncidentList);
-clearFilters?.addEventListener("click", () => {
-  if (severityFilter) severityFilter.value = "all";
-  if (userSearch) userSearch.value = "";
-  renderIncidentList();
-});
-seedDemo?.addEventListener("click", seedDemoEvents);
-
-document.addEventListener("visibilitychange", async () => {
-  if (!document.hidden) {
-    await refreshAll(true);
-    if (!wsConnected) connectWs();
-  }
+refreshBtn.addEventListener("click", () => {
+  loadInitialData().catch((err) => {
+    engineState.textContent = "Error";
+    engineMeta.textContent = err.message || "Manual refresh failed.";
+  });
 });
 
-window.addEventListener("focus", async () => {
-  await refreshAll(true);
-  if (!wsConnected) connectWs();
+loadInitialData().catch((err) => {
+  engineState.textContent = "Error";
+  engineMeta.textContent = err.message || "Could not load initial dashboard data.";
 });
 
-(async function boot() {
-  if (authStatus) authStatus.textContent = "Operator mode active";
-  await refreshAll(true);
-  connectWs();
-  startRefreshLoop();
-  startHeartbeat();
-})();
+connectSocket();

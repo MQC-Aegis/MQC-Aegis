@@ -1,13 +1,17 @@
 node_modules/
 .env
 .env.*
-*.db
-*.db-journal
 *.log
+
+*.db
+*.db-shm
+*.db-wal
+(SignalDesk D5 production hardening)
 backups/
 data/
 db/
 .DS_Store
+
 
 src/*.bak*
 src/*.save*
@@ -21,3 +25,7 @@ public_dashboard/*.bak*
 public_dashboard/*.save*
 public_dashboard/*.level*
 public_dashboard/index_backup.html
+
+*.bak
+*.phase*.bak
+(SignalDesk D5 production hardening)

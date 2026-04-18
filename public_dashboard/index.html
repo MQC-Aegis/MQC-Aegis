@@ -3,235 +3,380 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MQC Aegis — AI Decision Engine</title>
+  <title>SignalDesk — AI Decision Engine</title>
   <style>
     * { box-sizing: border-box; }
+
     body {
       margin: 0;
       font-family: Inter, Arial, sans-serif;
-      background: radial-gradient(circle at top, #071426 0%, #03101d 45%, #020b14 100%);
-      color: #e5eef8;
+      background: #0b1020;
+      color: #f5f7fb;
     }
+
     .wrap {
-      max-width: 1440px;
+      max-width: 1320px;
       margin: 0 auto;
-      padding: 14px;
+      padding: 32px 20px 60px;
     }
-    .topbar {
+
+    .hero {
       display: flex;
       justify-content: space-between;
-      align-items: flex-start;
-      gap: 12px;
-      margin-bottom: 14px;
+      align-items: end;
+      gap: 20px;
+      margin-bottom: 28px;
+      flex-wrap: wrap;
     }
+
     h1 {
-      margin: 0;
-      font-size: 28px;
+      margin: 0 0 8px;
+      font-size: 34px;
       line-height: 1.1;
     }
+
     .sub {
-      margin-top: 6px;
-      color: #8ea3b7;
-      font-size: 13px;
-      max-width: 760px;
+      color: #9aa4bf;
+      margin: 0;
+      font-size: 15px;
     }
-    .statuspill {
-      border: 1px solid rgba(255,255,255,.12);
+
+    .pillbar {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .pill {
+      background: #141b34;
+      border: 1px solid #253055;
+      padding: 10px 14px;
       border-radius: 999px;
-      padding: 8px 12px;
-      font-size: 12px;
-      color: #c9d7e5;
-      background: rgba(255,255,255,.03);
-      white-space: nowrap;
+      font-size: 14px;
+      color: #d5dcf2;
     }
-    .minirow {
-      display: flex;
-      gap: 10px;
-      margin-top: 8px;
-      flex-wrap: wrap;
-    }
-    .mini {
-      border: 1px solid rgba(255,255,255,.08);
-      border-radius: 10px;
-      padding: 6px 10px;
-      font-size: 12px;
-      color: #b5c6d8;
-    }
-    .toolbar {
-      display: flex;
-      gap: 10px;
-      margin-bottom: 14px;
-      flex-wrap: wrap;
-    }
-    .toolbar input, .toolbar select {
-      background: rgba(255,255,255,.04);
-      color: #e5eef8;
-      border: 1px solid rgba(255,255,255,.12);
-      border-radius: 10px;
-      padding: 10px 12px;
-      min-width: 180px;
-    }
-    .toolbar button {
-      background: rgba(255,255,255,.06);
-      color: #e5eef8;
-      border: 1px solid rgba(255,255,255,.14);
-      border-radius: 10px;
-      padding: 10px 12px;
-      cursor: pointer;
-    }
-    .grid {
+
+    .topgrid {
       display: grid;
-      grid-template-columns: 1.1fr 1fr 1fr 1fr;
-      gap: 14px;
-      align-items: start;
+      grid-template-columns: 320px 1fr;
+      gap: 20px;
+      margin-bottom: 20px;
     }
-    .panel {
-      border: 1px solid rgba(255,255,255,.1);
-      border-radius: 16px;
-      background: rgba(8, 20, 36, .82);
-      box-shadow: 0 10px 40px rgba(0,0,0,.25);
-      overflow: hidden;
-    }
-    .panelhead {
-      padding: 12px 14px;
-      border-bottom: 1px solid rgba(255,255,255,.08);
-      font-size: 11px;
-      letter-spacing: .14em;
-      text-transform: uppercase;
-      color: #89a1b8;
-    }
-    .panelbody {
-      padding: 14px;
-    }
-    .stack {
+
+    .summarygrid {
       display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
       gap: 14px;
+      margin-bottom: 20px;
     }
-    #liveFeed, #incidentList, #actionList {
-      min-height: 180px;
-      max-height: 620px;
-      overflow: auto;
+
+    .maingrid {
+      display: grid;
+      grid-template-columns: 1.35fr 1fr;
+      gap: 20px;
     }
-    #detailPanel {
-      min-height: 500px;
+
+    .card {
+      background: #12182b;
+      border: 1px solid #202944;
+      border-radius: 18px;
+      padding: 18px;
+      box-shadow: 0 10px 30px rgba(0,0,0,.22);
     }
+
+    .card h2 {
+      margin: 0 0 14px;
+      font-size: 18px;
+    }
+
     .muted {
-      color: #8ea3b7;
-      font-size: 12px;
+      color: #96a0bc;
     }
-    .btnrow {
-      display: flex;
-      gap: 8px;
-      margin-top: 12px;
-      flex-wrap: wrap;
+
+    .stat {
+      font-size: 34px;
+      font-weight: 700;
+      margin: 6px 0 2px;
     }
-    .btnrow button {
-      background: rgba(255,255,255,.06);
-      color: #e5eef8;
-      border: 1px solid rgba(255,255,255,.14);
-      border-radius: 10px;
-      padding: 8px 10px;
-      cursor: pointer;
+
+    .mini-stat {
+      font-size: 26px;
+      font-weight: 700;
+      margin: 6px 0 2px;
     }
-    .timeline {
-      display: flex;
-      align-items: flex-end;
-      gap: 8px;
-      min-height: 120px;
-      margin-top: 10px;
-    }
-    .barwrap {
+
+    .summary-lines {
       display: flex;
       flex-direction: column;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .summary-line {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 13px;
+      color: #d6def7;
+      background: #0f162b;
+      border: 1px solid #243150;
+      border-radius: 12px;
+      padding: 8px 10px;
+    }
+
+    .incident-list,
+    .action-list {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .incident,
+    .action-item {
+      border: 1px solid #27304c;
+      background: #0e1425;
+      border-radius: 16px;
+      padding: 14px;
+    }
+
+    .incident-top,
+    .action-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
       align-items: center;
-      gap: 6px;
-      min-width: 34px;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
     }
-    .bar {
-      width: 26px;
-      border-radius: 8px 8px 4px 4px;
-      background: rgba(255,255,255,.2);
-    }
-    .barlabel {
-      writing-mode: vertical-rl;
-      transform: rotate(180deg);
-      font-size: 10px;
-      color: #8ea3b7;
-      max-height: 70px;
-      overflow: hidden;
-    }
-    .barvalue {
-      font-size: 11px;
+
+    .incident-title,
+    .action-title {
+      font-size: 16px;
       font-weight: 700;
     }
-    @media (max-width: 1250px) {
-      .grid { grid-template-columns: 1fr 1fr; }
+
+    .badges {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
     }
-    @media (max-width: 900px) {
-      .grid { grid-template-columns: 1fr; }
+
+    .badge {
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: .02em;
+      border: 1px solid transparent;
+    }
+
+    .critical { background: rgba(255, 76, 76, .16); color: #ff9d9d; border-color: rgba(255, 76, 76, .35); }
+    .high { background: rgba(255, 163, 26, .16); color: #ffd089; border-color: rgba(255, 163, 26, .35); }
+    .medium { background: rgba(97, 164, 255, .16); color: #abd0ff; border-color: rgba(97, 164, 255, .35); }
+    .low { background: rgba(80, 201, 141, .16); color: #aef0c6; border-color: rgba(80, 201, 141, .35); }
+
+    .trend-spike { background: rgba(190, 80, 255, .16); color: #ddb1ff; border-color: rgba(190, 80, 255, .35); }
+    .trend-elevated { background: rgba(100, 181, 246, .16); color: #bfe0ff; border-color: rgba(100, 181, 246, .35); }
+    .trend-normal { background: rgba(120, 144, 156, .16); color: #d2dde3; border-color: rgba(120, 144, 156, .35); }
+
+    .corr-critical_chain { background: rgba(255, 82, 82, .18); color: #ffb1b1; border-color: rgba(255, 82, 82, .4); }
+    .corr-multi_signal { background: rgba(255, 193, 7, .16); color: #ffe08a; border-color: rgba(255, 193, 7, .35); }
+    .corr-none { background: rgba(120, 144, 156, .16); color: #d2dde3; border-color: rgba(120, 144, 156, .35); }
+
+    .row {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 10px;
+    }
+
+    .meta {
+      background: #121a30;
+      border-radius: 12px;
+      padding: 10px;
+      border: 1px solid #1d2745;
+    }
+
+    .meta-label {
+      display: block;
+      color: #8190b2;
+      font-size: 12px;
+      margin-bottom: 4px;
+    }
+
+    .meta-value {
+      font-size: 14px;
+      word-break: break-word;
+    }
+
+    .reason-list {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+    }
+
+    .reason-chip {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .02em;
+      padding: 6px 9px;
+      border-radius: 999px;
+      background: #18213b;
+      color: #d8e2ff;
+      border: 1px solid #2b3961;
+    }
+
+    .empty {
+      padding: 18px;
+      border-radius: 16px;
+      border: 1px dashed #30406b;
+      color: #9fb0d7;
+      background: #0d1428;
+    }
+
+    .live-dot {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      margin-right: 8px;
+      background: #ff6b6b;
+      box-shadow: 0 0 12px rgba(255,107,107,.7);
+    }
+
+    .live-dot.on {
+      background: #41d97b;
+      box-shadow: 0 0 12px rgba(65,217,123,.7);
+    }
+
+    button {
+      border: 0;
+      background: #2596BE;
+      color: white;
+      border-radius: 12px;
+      padding: 10px 14px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    button:hover { opacity: .92; }
+
+    @media (max-width: 1100px) {
+      .summarygrid {
+        grid-template-columns: 1fr 1fr;
+      }
+    }
+
+    @media (max-width: 980px) {
+      .topgrid,
+      .maingrid {
+        grid-template-columns: 1fr;
+      }
+
+      .row,
+      .summarygrid {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="topbar">
+    <div class="hero">
       <div>
-        <h1>MQC Aegis — AI Decision Engine</h1>
-        <div class="sub">
-          From fragmented signals to operational action.
-        </div>
-        <div class="minirow">
-          <div class="mini" id="authStatus">Booting operator mode</div>
-          <div class="mini" id="connection-status">WS pending</div>
-        </div>
+        <h1>SignalDesk</h1>
+        <p class="sub">AI Decision Engine · live incidents, actions, trends, correlation and summary</p>
       </div>
-      <div class="statuspill">Operator board</div>
+
+      <div class="pillbar">
+        <div class="pill">Phase: <strong id="phaseLabel">D4.1</strong></div>
+        <div class="pill">Incidents: <strong id="incidentCount">0</strong></div>
+        <div class="pill">Actions: <strong id="actionCount">0</strong></div>
+        <div class="pill"><span id="liveDot" class="live-dot"></span><strong id="socketStatus">socket offline</strong></div>
+      </div>
     </div>
 
-    <div class="toolbar">
-      <select id="severityFilter">
-        <option value="all">All severities</option>
-        <option value="critical">Critical only</option>
-        <option value="high">High only</option>
-        <option value="medium">Medium only</option>
-        <option value="low">Low only</option>
-      </select>
-      <input id="userSearch" type="text" placeholder="Search user..." />
-      <button id="clearFilters">Clear filters</button>
-      <button id="seedDemo">Seed demo events</button>
+    <div class="topgrid">
+      <div class="card">
+        <h2>Engine status</h2>
+        <div class="muted">Backend health</div>
+        <div class="stat" id="engineState">—</div>
+        <p class="muted" id="engineMeta">Waiting for server response.</p>
+        <button id="refreshBtn">Manual refresh</button>
+      </div>
+
+      <div class="card">
+        <h2>Decision posture</h2>
+        <div class="muted">Latest engine stance</div>
+        <div class="stat" id="decisionState">Monitoring</div>
+        <p class="muted" id="decisionMeta">Awaiting live data.</p>
+      </div>
     </div>
 
-    <div class="grid">
-      <div class="stack">
-        <div class="panel">
-          <div class="panelhead">AI Summary</div>
-          <div class="panelbody" id="aiSummary">Loading summary...</div>
-        </div>
+    <div class="summarygrid">
+      <div class="card">
+        <h2>Total incidents</h2>
+        <div class="mini-stat" id="totalIncidents">0</div>
+        <p class="muted">Stored incidents</p>
+      </div>
 
-        <div class="panel">
-          <div class="panelhead">Risk Timeline</div>
-          <div class="panelbody" id="riskTimeline">Loading timeline...</div>
-        </div>
+      <div class="card">
+        <h2>Total actions</h2>
+        <div class="mini-stat" id="totalActions">0</div>
+        <p class="muted">Logged decisions</p>
+      </div>
 
-        <div class="panel">
-          <div class="panelhead">Live Decision Feed</div>
-          <div class="panelbody" id="liveFeed"></div>
+      <div class="card">
+        <h2>Total events</h2>
+        <div class="mini-stat" id="totalEvents">0</div>
+        <p class="muted">Tracked raw events</p>
+      </div>
+
+      <div class="card">
+        <h2>Severity mix</h2>
+        <div id="severitySummary" class="summary-lines"></div>
+      </div>
+
+      <div class="card">
+        <h2>Action mix</h2>
+        <div id="actionSummary" class="summary-lines"></div>
+      </div>
+
+      <div class="card">
+        <h2>Trend mix</h2>
+        <div id="trendSummary" class="summary-lines"></div>
+      </div>
+
+      <div class="card">
+        <h2>Correlation mix</h2>
+        <div id="correlationSummary" class="summary-lines"></div>
+      </div>
+
+      <div class="card">
+        <h2>Latest incident</h2>
+        <div id="latestIncidentSummary" class="summary-lines"></div>
+      </div>
+
+      <div class="card">
+        <h2>Latest action</h2>
+        <div id="latestActionSummary" class="summary-lines"></div>
+      </div>
+    </div>
+
+    <div class="maingrid">
+      <div class="card">
+        <h2>Incident stream</h2>
+        <div id="incidentList" class="incident-list">
+          <div class="empty">No incidents yet. Post to <code>/event</code> and they will appear here live.</div>
         </div>
       </div>
 
-      <div class="panel">
-        <div class="panelhead">Incident Stream</div>
-        <div class="panelbody" id="incidentList"></div>
-      </div>
-
-      <div class="panel">
-        <div class="panelhead">Operator Actions</div>
-        <div class="panelbody" id="actionList"></div>
-      </div>
-
-      <div class="panel">
-        <div class="panelhead">Incident Drilldown</div>
-        <div class="panelbody" id="detailPanel">Select an incident.</div>
+      <div class="card">
+        <h2>Action feed</h2>
+        <div id="actionList" class="action-list">
+          <div class="empty">No actions yet. Decisions will appear here live.</div>
+        </div>
       </div>
     </div>
   </div>
