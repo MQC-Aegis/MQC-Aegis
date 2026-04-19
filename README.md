@@ -1,78 +1,67 @@
 # MQC-Aegis
 
-**MQC-Aegis** is a live AI decision engine for operational risk events.
-
-It ingests raw events, normalizes them, scores risk, detects trend and correlation patterns, decides actions, stores results, and streams everything live to a dashboard.
+MQC-Aegis is a real-time decision engine for live risk monitoring, incident creation, action logging, correlation analysis, and executive-ready operational visibility.
 
 ## What it does
 
-MQC-Aegis processes incoming events such as:
+MQC-Aegis turns fragmented signals into:
+- correlated incidents
+- operator actions
+- live dashboard decisions
+- executive summary posture
 
-- login attempts
-- payment events
-- suspicious velocity spikes
-- geo mismatches
-- repeated attempts
-- high-risk multi-signal patterns
-
-For each event, MQC-Aegis can:
-
-- normalize the payload
-- calculate a risk score
-- detect trend anomalies
-- detect multi-signal correlation
-- decide an action
-- store incidents and actions in SQLite
-- update the live dashboard over WebSocket
+The platform evaluates live event payloads through:
+- trend detection
+- multi-signal correlation
+- dynamic risk scoring
+- action decision logic
 
 ## Core capabilities
 
-- Live incident engine
-- Decision engine with action output
-- Trend and correlation detection
-- SQLite persistence
-- Filterable API endpoints
-- Summary endpoint
+- Real-time event processing
+- Incident and action generation
+- Trend and correlation labels
+- Executive summary layer
+- Demo mode scenarios
 - Live WebSocket dashboard
-- API key protection for write access
+- SQLite-backed local demo persistence
+- Railway-ready deployment
 
-## Live deployment
+## Dashboard modules
 
-Public dashboard:
+- Executive View
+- Scenario Launcher
+- Stream Filters
+- Clear Demo Data
+- Engine Status
+- Decision Posture
+- Incident Stream
+- Action Feed
 
-`https://mqc-aegis-production.up.railway.app`
+## Local run
 
-## API overview
+Run:
 
-### Public read endpoints
+    npm install
+    npm start
 
-- `GET /health`
-- `GET /api/incidents`
-- `GET /api/actions`
-- `GET /api/summary`
+Open:
+http://localhost:3000
 
-### Protected write endpoint
+## API endpoints
 
-- `POST /event`
+- GET /health
+- POST /event
+- GET /api/incidents
+- GET /api/actions
+- GET /api/summary
+- POST /api/admin/clear-demo
 
-`POST /event` requires an API key in the request header:
+## Stack
 
-`x-api-key: YOUR_SIGNALDESK_API_KEY`
-
----
-
-## Example event flow
-
-Raw event input:
-
-```json
-{
-  "type": "payment",
-  "user": "anna",
-  "amount": 25000,
-  "risk": 65,
-  "attempts": 4,
-  "ip": "unknown",
-  "geoMismatch": true,
-  "velocitySpike": true
-}
+- Node.js
+- Express
+- WebSocket (ws)
+- SQLite
+- Vanilla frontend dashboard
+- Railway deployment
