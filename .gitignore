@@ -17,3 +17,5 @@ signaldesk.db.bak.*
 src/server.financial.broken.js
 src/server.financial.js
 src/server.js.save.*
+public_dashboard/*.fix.*
+public_dashboard/*.bak.*

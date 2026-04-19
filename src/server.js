@@ -1,5 +1,6 @@
 import http from "http";
 import express from "express";
+import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { WebSocketServer } from "ws";
@@ -396,6 +397,58 @@ wss.on("connection", (socket) => {
     summary: buildSummary()
   }));
 });
+
+
+app.post("/api/admin/clear-demo", async (_req, res) => {
+  try {
+    if (db) {
+      await db.close();
+      db = null;
+    }
+
+    await fs.promises.unlink(DB_FILE).catch((err) => {
+      if (err && err.code !== "ENOENT") throw err;
+    });
+
+    incidentStore.length = 0;
+    actionStore.length = 0;
+    eventStore.length = 0;
+
+    await initDb();
+
+    if (typeof broadcast === "function") {
+      broadcast({
+        type: "event_processed",
+        incidents: incidentStore,
+        actions: actionStore,
+        summary: {
+          totals: { incidents: 0, actions: 0, events: 0 },
+          severity: { critical: 0, high: 0, medium: 0, low: 0 },
+          actions: { block: 0, manual_review: 0, rate_limit: 0, allow: 0 },
+          trends: { spike: 0, elevated: 0, normal: 0 },
+          correlations: { critical_chain: 0, multi_signal: 0, none: 0 },
+          latest: { incident: null, action: null }
+        }
+      });
+    }
+
+    return res.json({
+      ok: true,
+      cleared: true,
+      db: "signaldesk.db",
+      incidents: 0,
+      actions: 0,
+      events: 0
+    });
+  } catch (err) {
+    console.error("[SignalDesk] clear-demo failed:", err);
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "Clear demo failed."
+    });
+  }
+});
+
 
 app.get("/health", (_req, res) => {
   const healthOk = !isShuttingDown && !!db;
