@@ -1,12 +1,12 @@
-# SignalDesk
+# MQC-Aegis
 
-**SignalDesk** is a live AI decision engine for operational risk events.
+**MQC-Aegis** is a live AI decision engine for operational risk events.
 
 It ingests raw events, normalizes them, scores risk, detects trend and correlation patterns, decides actions, stores results, and streams everything live to a dashboard.
 
 ## What it does
 
-SignalDesk processes incoming events such as:
+MQC-Aegis processes incoming events such as:
 
 - login attempts
 - payment events
@@ -15,7 +15,7 @@ SignalDesk processes incoming events such as:
 - repeated attempts
 - high-risk multi-signal patterns
 
-For each event, SignalDesk can:
+For each event, MQC-Aegis can:
 
 - normalize the payload
 - calculate a risk score
