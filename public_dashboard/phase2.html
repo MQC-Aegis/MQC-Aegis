@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MQC-Aegis — Phase 2</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, Arial, sans-serif;
+      background: #0b1020;
+      color: #eaf1ff;
+    }
+    .wrap {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    .hero {
+      display: grid;
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    .hero h1 {
+      margin: 0;
+      font-size: 34px;
+    }
+    .hero p {
+      margin: 0;
+      color: #9fb1d1;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap: 16px;
+    }
+    .card {
+      background: #121a30;
+      border: 1px solid #22314f;
+      border-radius: 18px;
+      padding: 16px;
+      box-shadow: 0 10px 30px rgba(0,0,0,.25);
+    }
+    .span-3 { grid-column: span 3; }
+    .span-4 { grid-column: span 4; }
+    .span-6 { grid-column: span 6; }
+    .span-12 { grid-column: span 12; }
+    .label {
+      font-size: 12px;
+      color: #8ea3c7;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      margin-bottom: 8px;
+    }
+    .metric {
+      font-size: 30px;
+      font-weight: 700;
+    }
+    .sub {
+      margin-top: 6px;
+      font-size: 13px;
+      color: #9fb1d1;
+    }
+    .pill {
+      display: inline-block;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      background: #1c2742;
+      border: 1px solid #31456c;
+    }
+    .ok { color: #7CFFB2; }
+    .warn { color: #FFD166; }
+    .bad { color: #FF6B6B; }
+    ul {
+      list-style: none;
+      padding: 0;
+      margin: 10px 0 0 0;
+      display: grid;
+      gap: 10px;
+      max-height: 420px;
+      overflow: auto;
+    }
+    li {
+      background: #0e162b;
+      border: 1px solid #22314f;
+      border-radius: 14px;
+      padding: 12px;
+    }
+    .row {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      color: #9fb1d1;
+      white-space: pre-wrap;
+    }
+    @media (max-width: 980px) {
+      .span-3, .span-4, .span-6, .span-12 { grid-column: span 12; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hero">
+      <h1>MQC-Aegis — Phase 2</h1>
+      <p>Adaptive decision engine with identity, drift, convergence, narratives and reflection.</p>
+    </div>
+
+    <div class="grid">
+      <div class="card span-3">
+        <div class="label">System Status</div>
+        <div id="status" class="metric">...</div>
+        <div id="statusSub" class="sub">Loading</div>
+      </div>
+
+      <div class="card span-3">
+        <div class="label">Drift Score</div>
+        <div id="drift" class="metric">0.00</div>
+        <div class="sub">Identity vs current state</div>
+      </div>
+
+      <div class="card span-3">
+        <div class="label">Baseline Risk</div>
+        <div id="baselineRisk" class="metric">0</div>
+        <div class="sub">Adaptive baseline</div>
+      </div>
+
+      <div class="card span-3">
+        <div class="label">Baseline Volume</div>
+        <div id="baselineVolume" class="metric">0</div>
+        <div class="sub">Adaptive throughput</div>
+      </div>
+
+      <div class="card span-6">
+        <div class="label">System Reflection</div>
+        <div id="reflection" class="mono">Waiting for reflection...</div>
+      </div>
+
+      <div class="card span-6">
+        <div class="label">Live Feed</div>
+        <ul id="feed"></ul>
+      </div>
+
+      <div class="card span-4">
+        <div class="label">Incidents</div>
+        <ul id="incidents"></ul>
+      </div>
+
+      <div class="card span-4">
+        <div class="label">Actions</div>
+        <ul id="actions"></ul>
+      </div>
+
+      <div class="card span-4">
+        <div class="label">Narratives</div>
+        <ul id="narratives"></ul>
+      </div>
+    </div>
+  </div>
+
+  <script src="./phase2.js"></script>
+</body>
+</html>
