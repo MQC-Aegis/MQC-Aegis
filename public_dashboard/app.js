@@ -8,6 +8,100 @@ const state = {
   latestSummary: null
 };
 
+
+
+function pickPanelFocus(summary, incidents, actions) {
+  if (summary && summary.panelFocus) return summary.panelFocus;
+
+  const merged = [
+    ...(Array.isArray(actions) ? actions.map(x => ({ ...x, __kind: "action" })) : []),
+    ...(Array.isArray(incidents) ? incidents.map(x => ({ ...x, __kind: "incident" })) : [])
+  ];
+
+  const ts = (x) => {
+    const raw = x?.createdAt || x?.timestamp || 0;
+    const n = new Date(raw).getTime();
+    return Number.isFinite(n) ? n : 0;
+  };
+
+  merged.sort((a, b) => ts(b) - ts(a));
+
+  const isInteresting = (x) => {
+    const text = [
+      x?.divergenceLabel,
+      x?.divergenceState,
+      x?.divergenceExplanation,
+      x?.mqcSuggestion,
+      x?.mqcDecision,
+      x?.mqcLabel,
+      x?.reason,
+      x?.reasonCodes ? x.reasonCodes.join(" ") : "",
+      x?.status,
+      x?.label,
+      x?.title,
+      x?.type
+    ].filter(Boolean).join(" ").toLowerCase();
+
+    return (
+      text.includes("diverged") ||
+      text.includes("divergence") ||
+      text.includes("mqc") ||
+      text.includes("cluster") ||
+      text.includes("pattern")
+    );
+  };
+
+  return merged.find(isInteresting) || merged[0] || null;
+}
+
+function decisionFromFocus(focus, fallbackValue = "manual_review") {
+  return (
+    focus?.finalAction ||
+    focus?.decision ||
+    focus?.action ||
+    focus?.statusSuggested ||
+    fallbackValue
+  );
+}
+
+function mqcFromFocus(focus, fallbackValue = "quiet") {
+  return (
+    focus?.mqcSuggestion ||
+    focus?.mqcDecision ||
+    focus?.mqcLabel ||
+    fallbackValue
+  );
+}
+
+function divergenceFromFocus(focus, currentDecision, mqcDecision) {
+  const text = [
+    focus?.divergenceExplanation,
+    focus?.divergenceLabel,
+    focus?.divergenceState,
+    focus?.reason,
+    focus?.status
+  ].filter(Boolean).join(" ").toLowerCase();
+
+  if (
+    text.includes("diverged") ||
+    text.includes("divergence") ||
+    text.includes("converged+mqc") ||
+    (currentDecision && mqcDecision && currentDecision !== mqcDecision)
+  ) {
+    return "Diverged";
+  }
+  return "Aligned";
+}
+
+function explanationFromFocus(focus, currentDecision, mqcDecision) {
+  if (focus?.divergenceExplanation) return focus.divergenceExplanation;
+
+  const reasons = Array.isArray(focus?.reasonCodes) ? focus.reasonCodes.join(", ") : "";
+  if (currentDecision !== mqcDecision) {
+    return `SignalDesk chose ${currentDecision} while MQC suggested ${mqcDecision}. ${reasons}`.trim();
+  }
+  return `Both engines pointed in the same direction. ${reasons}`.trim();
+}
 function escapeHtml(v) {
   return String(v ?? "")
     .replaceAll("&", "&amp;")
@@ -277,6 +371,12 @@ function buildDivergenceExplanation(comp, latestEventPayload) {
 }
 
 function renderDecisionPanel() {
+  const panelFocus = pickPanelFocus(summary, incidents, actions);
+  const panelCurrentDecision = decisionFromFocus(panelFocus, summary?.recommendation || 'manual_review');
+  const panelMQCDecision = mqcFromFocus(panelFocus, 'quiet');
+  const panelDivergence = divergenceFromFocus(panelFocus, panelCurrentDecision, panelMQCDecision);
+  const panelExplanation = explanationFromFocus(panelFocus, panelCurrentDecision, panelMQCDecision);
+
   const comp = state.comparisons[0];
   const latest = state.latestEventPayload;
   markDivergenceTiles(comp);

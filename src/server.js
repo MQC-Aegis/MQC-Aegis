@@ -290,7 +290,84 @@ app.get("/api/users/memory/:user", async (req, res) => {
   }
 });
 
+
+
+function selectDecisionPanelFocus(incidentStore, actionStore) {
+  const incidents = Array.isArray(incidentStore) ? [...incidentStore] : [];
+  const actions = Array.isArray(actionStore) ? [...actionStore] : [];
+
+  const ts = (x) => {
+    const raw = x?.createdAt || x?.timestamp || 0;
+    const n = new Date(raw).getTime();
+    return Number.isFinite(n) ? n : 0;
+  };
+
+  const merged = [
+    ...incidents.map((x) => ({ ...x, __kind: "incident" })),
+    ...actions.map((x) => ({ ...x, __kind: "action" }))
+  ].sort((a, b) => ts(b) - ts(a));
+
+  const isDiverged = (x) => {
+    const text = [
+      x?.divergenceLabel,
+      x?.divergenceState,
+      x?.divergenceExplanation,
+      x?.mqcDisposition,
+      x?.mqcLabel,
+      x?.explanation,
+      x?.reason,
+      x?.status
+    ].filter(Boolean).join(" ").toLowerCase();
+
+    return (
+      text.includes("diverged") ||
+      text.includes("divergence") ||
+      text.includes("converged+mqc") ||
+      text.includes("mqc escalation") ||
+      text.includes("pattern recognition")
+    );
+  };
+
+  const isMQCRelevant = (x) => {
+    const text = [
+      x?.type,
+      x?.title,
+      x?.label,
+      x?.mqcSuggestion,
+      x?.mqcDecision,
+      x?.mqcLabel,
+      x?.divergenceExplanation,
+      x?.reason,
+      x?.reasonCodes && Array.isArray(x.reasonCodes) ? x.reasonCodes.join(" ") : ""
+    ].filter(Boolean).join(" ").toLowerCase();
+
+    return (
+      text.includes("mqc") ||
+      text.includes("cluster") ||
+      text.includes("payment_cluster") ||
+      text.includes("cluster_plus_history") ||
+      text.includes("pattern")
+    );
+  };
+
+  const severe = (x) => {
+    const sev = String(x?.severity || "").toLowerCase();
+    const act = String(x?.action || x?.finalAction || x?.decision || "").toLowerCase();
+    return sev === "critical" || act === "block";
+  };
+
+  const best =
+    merged.find((x) => isDiverged(x) && isMQCRelevant(x)) ||
+    merged.find((x) => isMQCRelevant(x) && severe(x)) ||
+    merged.find((x) => isMQCRelevant(x)) ||
+    merged[0] ||
+    null;
+
+  return best;
+}
 app.get("/api/summary", async (req, res) => {
+  const panelFocus = selectDecisionPanelFocus(incidentStore, actionStore);
+
   try {
     const recentIncidents = await db.all(`
       SELECT *
@@ -332,6 +409,8 @@ app.get("/api/summary", async (req, res) => {
     });
 
     res.json({
+      panelFocus,
+
       ok: true,
       summary,
       drift,
