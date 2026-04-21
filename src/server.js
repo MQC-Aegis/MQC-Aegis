@@ -1,680 +1,593 @@
 import http from "http";
 import express from "express";
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
+
+import { initDb, persistComparison, persistIncident, persistLearningLog, persistNarrative } from "./lib/db.js";
+import { broadcast, setWss } from "./lib/runtime.js";
+import {
+  actionStore,
+  alertCooldown,
+  compareStore,
+  globalEvents,
+  incidentStore,
+  learningState,
+  narrativeStore,
+  systemIdentity,
+  trendStore,
+  userMemory
+} from "./lib/state.js";
+import { nowIso, parseJsonSafe } from "./lib/utils.js";
 import { WebSocketServer } from "ws";
-import sqlite3 from "sqlite3";
-import { open } from "sqlite";
+import { buildNarrative, buildReasonCodes, shouldCreateIncident } from "./lib/domain.js";
+import { resolveDecisionEngine } from "./lib/engine.js";
+import {
+  generateSystemReflection,
+  getComparisonStats,
+  getCurrentStats,
+  adaptSystemIdentity,
+  evaluateIdentityDrift,
+  runAutoLearn
+} from "./lib/learning.js";
+import {
+  loadUserMemory,
+  updateUserMemoryFromDecision,
+  updateUserMemoryFromEvent
+} from "./lib/memory.js";
+import { actionFromRisk, detectTrendAnomaly, severityFromRisk } from "./lib/risk.js";
 
 const app = express();
 app.use(express.json());
+app.use(express.static("public_dashboard"));
 
-const PORT = Number(process.env.PORT || 3000);
-const HOST = process.env.HOST || "0.0.0.0";
-const NODE_ENV = process.env.NODE_ENV || "development";
-const DB_FILE = path.resolve(process.env.DB_FILE || "./signaldesk.db");
+const PORT = process.env.PORT || 3000;
+const MQC_ENABLED = process.env.MQC_ENABLED === "true";
+const MQC_MODE = process.env.MQC_MODE || "shadow";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const publicDir = path.join(__dirname, "..", "public_dashboard");
+const db = await initDb();
+await loadUserMemory(db, userMemory);
 
-app.use(express.static(publicDir));
-
-let db;
-let isShuttingDown = false;
-
-const incidentStore = [];
-const actionStore = [];
-const eventStore = [];
-
-function resetArray(target, items) {
-  target.length = 0;
-  target.push(...items);
-}
-
-function normalizeEvent(input = {}) {
-  return {
-    type: String(input.type || "unknown").toLowerCase(),
-    user: String(input.user || "anonymous"),
-    amount: Number(input.amount || 0),
-    risk: Number(input.risk || 0),
-    attempts: Number(input.attempts || 0),
-    ip: String(input.ip || "unknown"),
-    geoMismatch: Boolean(input.geoMismatch || false),
-    velocitySpike: Boolean(input.velocitySpike || false),
-    timestamp: new Date().toISOString()
-  };
-}
-
-function getRecentEvents({ user, seconds = 120 }) {
-  const cutoff = Date.now() - seconds * 1000;
-  return eventStore.filter((item) => {
-    return item.user === user && new Date(item.timestamp).getTime() >= cutoff;
-  });
-}
-
-function detectTrendAnomaly(event) {
-  const recentUserEvents = getRecentEvents({ user: event.user, seconds: 120 });
-  const sameTypeCount = recentUserEvents.filter((e) => e.type === event.type).length;
-
-  if (recentUserEvents.length >= 5 || sameTypeCount >= 4) {
-    return { label: "spike", scoreBoost: 20, reasonCodes: ["TREND_SPIKE"] };
-  }
-
-  if (recentUserEvents.length >= 3 || sameTypeCount >= 2) {
-    return { label: "elevated", scoreBoost: 10, reasonCodes: ["TREND_ELEVATED"] };
-  }
-
-  return { label: "normal", scoreBoost: 0, reasonCodes: [] };
-}
-
-function detectCorrelation(event) {
-  let signals = 0;
-  const reasonCodes = [];
-
-  if (event.velocitySpike) { signals += 1; reasonCodes.push("VELOCITY_SPIKE"); }
-  if (event.geoMismatch) { signals += 1; reasonCodes.push("GEO_MISMATCH"); }
-  if (event.attempts >= 3) { signals += 1; reasonCodes.push("REPEAT_ATTEMPTS"); }
-  if (event.amount > 10000) { signals += 1; reasonCodes.push("HIGH_AMOUNT"); }
-  if (event.ip === "unknown") { signals += 1; reasonCodes.push("UNSEEN_IP"); }
-  if (event.risk >= 60) { signals += 1; reasonCodes.push("BASE_RISK_HIGH"); }
-
-  if (signals >= 4) {
-    return { label: "critical_chain", scoreBoost: 25, reasonCodes };
-  }
-
-  if (signals >= 2) {
-    return { label: "multi_signal", scoreBoost: 12, reasonCodes };
-  }
-
-  return { label: "none", scoreBoost: 0, reasonCodes };
-}
-
-function calculateRiskScore(event, trend, correlation) {
-  let score = 0;
-  const reasonCodes = [];
-
-  score += event.risk;
-  if (event.risk > 0) reasonCodes.push("BASE_RISK");
-
-  if (event.attempts >= 3) { score += 20; reasonCodes.push("ATTEMPTS_OVER_3"); }
-  if (event.amount > 10000) { score += 25; reasonCodes.push("AMOUNT_OVER_10000"); }
-  if (event.geoMismatch) { score += 20; reasonCodes.push("GEO_MISMATCH"); }
-  if (event.velocitySpike) { score += 15; reasonCodes.push("VELOCITY_SPIKE"); }
-  if (event.ip === "unknown") { score += 10; reasonCodes.push("UNKNOWN_IP"); }
-
-  score += trend.scoreBoost;
-  score += correlation.scoreBoost;
-
-  reasonCodes.push(...trend.reasonCodes);
-  reasonCodes.push(...correlation.reasonCodes);
-
-  if (score > 100) score = 100;
-
-  return {
-    score,
-    reasonCodes: [...new Set(reasonCodes)]
-  };
-}
-
-function decideAction(riskScore, context) {
-  if (riskScore >= 90 || context.correlationLabel === "critical_chain") {
-    return {
-      action: "block",
-      severity: "critical",
-      status: "pending_review",
-      reason: "Critical multi-signal risk detected"
-    };
-  }
-
-  if (
-    riskScore >= 70 ||
-    context.trendLabel === "spike" ||
-    context.correlationLabel === "multi_signal"
-  ) {
-    return {
-      action: "manual_review",
-      severity: "high",
-      status: "open",
-      reason: "Escalated risk pattern requires analyst review"
-    };
-  }
-
-  if (riskScore >= 40 || context.trendLabel === "elevated") {
-    return {
-      action: "rate_limit",
-      severity: "medium",
-      status: "monitor",
-      reason: "Risk is elevated and should be monitored"
-    };
-  }
-
-  return {
-    action: "allow",
-    severity: "low",
-    status: "ok",
-    reason: "Risk is within acceptable range"
-  };
-}
-
-function createIncident(event, riskScore, decision, trend, correlation, reasonCodes) {
-  return {
-    type: event.type,
-    user: event.user,
-    amount: event.amount,
-    ip: event.ip,
-    risk: event.risk,
-    riskScore,
-    severity: decision.severity,
-    action: decision.action,
-    status: decision.status,
-    reason: decision.reason,
-    reasonCodes,
-    trendLabel: trend.label,
-    correlationLabel: correlation.label,
-    geoMismatch: event.geoMismatch,
-    velocitySpike: event.velocitySpike,
-    attempts: event.attempts,
-    createdAt: event.timestamp
-  };
-}
-
-function createActionLog(event, riskScore, decision, incidentId, trendLabel, correlationLabel) {
-  return {
-    incidentId,
-    user: event.user,
-    type: event.type,
-    action: decision.action,
-    severity: decision.severity,
-    status: decision.status,
-    reason: decision.reason,
-    riskScore,
-    trendLabel,
-    correlationLabel,
-    createdAt: event.timestamp
-  };
-}
-
-function parseBooleanParam(value) {
-  if (value === undefined) return undefined;
-  if (value === "true" || value === "1") return true;
-  if (value === "false" || value === "0") return false;
-  return undefined;
-}
-
-function parsePositiveInt(value, fallback) {
-  const parsed = Number.parseInt(String(value ?? ""), 10);
-  if (Number.isNaN(parsed) || parsed <= 0) return fallback;
-  return parsed;
-}
-
-function applyIncidentFilters(items, query) {
-  const severity = query.severity ? String(query.severity).toLowerCase() : null;
-  const type = query.type ? String(query.type).toLowerCase() : null;
-  const action = query.action ? String(query.action).toLowerCase() : null;
-  const status = query.status ? String(query.status).toLowerCase() : null;
-  const user = query.user ? String(query.user).toLowerCase() : null;
-  const trendLabel = query.trendLabel ? String(query.trendLabel).toLowerCase() : null;
-  const correlationLabel = query.correlationLabel ? String(query.correlationLabel).toLowerCase() : null;
-  const geoMismatch = parseBooleanParam(query.geoMismatch);
-  const velocitySpike = parseBooleanParam(query.velocitySpike);
-  const minRiskScore = query.minRiskScore !== undefined ? Number(query.minRiskScore) : null;
-  const maxRiskScore = query.maxRiskScore !== undefined ? Number(query.maxRiskScore) : null;
-  const limit = parsePositiveInt(query.limit, 50);
-
-  return items
-    .filter((item) => !severity || item.severity?.toLowerCase() === severity)
-    .filter((item) => !type || item.type?.toLowerCase() === type)
-    .filter((item) => !action || item.action?.toLowerCase() === action)
-    .filter((item) => !status || item.status?.toLowerCase() === status)
-    .filter((item) => !user || item.user?.toLowerCase().includes(user))
-    .filter((item) => !trendLabel || item.trendLabel?.toLowerCase() === trendLabel)
-    .filter((item) => !correlationLabel || item.correlationLabel?.toLowerCase() === correlationLabel)
-    .filter((item) => geoMismatch === undefined || item.geoMismatch === geoMismatch)
-    .filter((item) => velocitySpike === undefined || item.velocitySpike === velocitySpike)
-    .filter((item) => minRiskScore === null || item.riskScore >= minRiskScore)
-    .filter((item) => maxRiskScore === null || item.riskScore <= maxRiskScore)
-    .slice(0, limit);
-}
-
-function applyActionFilters(items, query) {
-  const severity = query.severity ? String(query.severity).toLowerCase() : null;
-  const type = query.type ? String(query.type).toLowerCase() : null;
-  const action = query.action ? String(query.action).toLowerCase() : null;
-  const status = query.status ? String(query.status).toLowerCase() : null;
-  const user = query.user ? String(query.user).toLowerCase() : null;
-  const trendLabel = query.trendLabel ? String(query.trendLabel).toLowerCase() : null;
-  const correlationLabel = query.correlationLabel ? String(query.correlationLabel).toLowerCase() : null;
-  const minRiskScore = query.minRiskScore !== undefined ? Number(query.minRiskScore) : null;
-  const maxRiskScore = query.maxRiskScore !== undefined ? Number(query.maxRiskScore) : null;
-  const limit = parsePositiveInt(query.limit, 50);
-
-  return items
-    .filter((item) => !severity || item.severity?.toLowerCase() === severity)
-    .filter((item) => !type || item.type?.toLowerCase() === type)
-    .filter((item) => !action || item.action?.toLowerCase() === action)
-    .filter((item) => !status || item.status?.toLowerCase() === status)
-    .filter((item) => !user || item.user?.toLowerCase().includes(user))
-    .filter((item) => !trendLabel || item.trendLabel?.toLowerCase() === trendLabel)
-    .filter((item) => !correlationLabel || item.correlationLabel?.toLowerCase() === correlationLabel)
-    .filter((item) => minRiskScore === null || item.riskScore >= minRiskScore)
-    .filter((item) => maxRiskScore === null || item.riskScore <= maxRiskScore)
-    .slice(0, limit);
-}
-
-function countBy(items, key, allowedValues = []) {
-  const initial = Object.fromEntries(allowedValues.map((value) => [value, 0]));
-  for (const item of items) {
-    const value = item?.[key] ?? "unknown";
-    initial[value] = (initial[value] || 0) + 1;
-  }
-  return initial;
-}
-
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
-
-function broadcast(payload) {
-  const message = JSON.stringify(payload);
-  for (const client of wss.clients) {
-    if (client.readyState === 1) {
-      client.send(message);
-    }
-  }
-}
-
-async function initDb() {
-  db = await open({
-    filename: DB_FILE,
-    driver: sqlite3.Database
-  });
-
-  await db.exec(`
-    PRAGMA journal_mode = WAL;
-
-    CREATE TABLE IF NOT EXISTS events (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      type TEXT,
-      user TEXT,
-      amount REAL,
-      risk INTEGER,
-      attempts INTEGER,
-      ip TEXT,
-      geoMismatch INTEGER,
-      velocitySpike INTEGER,
-      timestamp TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS incidents (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      type TEXT,
-      user TEXT,
-      amount REAL,
-      ip TEXT,
-      risk INTEGER,
-      riskScore INTEGER,
-      severity TEXT,
-      action TEXT,
-      status TEXT,
-      reason TEXT,
-      reasonCodes TEXT,
-      trendLabel TEXT,
-      correlationLabel TEXT,
-      geoMismatch INTEGER,
-      velocitySpike INTEGER,
-      attempts INTEGER,
-      createdAt TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS actions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      incidentId INTEGER,
-      user TEXT,
-      type TEXT,
-      action TEXT,
-      severity TEXT,
-      status TEXT,
-      reason TEXT,
-      riskScore INTEGER,
-      trendLabel TEXT,
-      correlationLabel TEXT,
-      createdAt TEXT
-    );
-  `);
-}
-
-function parseIncidentRow(row) {
-  return {
-    ...row,
-    geoMismatch: Boolean(row.geoMismatch),
-    velocitySpike: Boolean(row.velocitySpike),
-    reasonCodes: row.reasonCodes ? JSON.parse(row.reasonCodes) : []
-  };
-}
-
-function parseEventRow(row) {
-  return {
-    ...row,
-    geoMismatch: Boolean(row.geoMismatch),
-    velocitySpike: Boolean(row.velocitySpike)
-  };
-}
-
-async function hydrateStores() {
-  const dbEvents = await db.all(`SELECT * FROM events ORDER BY id DESC LIMIT 500`);
-  const dbIncidents = await db.all(`SELECT * FROM incidents ORDER BY id DESC LIMIT 100`);
-  const dbActions = await db.all(`SELECT * FROM actions ORDER BY id DESC LIMIT 100`);
-
-  resetArray(eventStore, dbEvents.map(parseEventRow));
-  resetArray(incidentStore, dbIncidents.map(parseIncidentRow));
-  resetArray(actionStore, dbActions);
-}
-
-function buildSummary() {
-  return {
-    totals: {
-      incidents: incidentStore.length,
-      actions: actionStore.length,
-      events: eventStore.length
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "SignalDesk",
+    ws: Boolean(setWss),
+    mqc: {
+      enabled: MQC_ENABLED,
+      mode: MQC_ENABLED ? MQC_MODE : "disabled"
     },
-    severity: countBy(incidentStore, "severity", ["critical", "high", "medium", "low"]),
-    actions: countBy(actionStore, "action", ["block", "manual_review", "rate_limit", "allow"]),
-    trends: countBy(incidentStore, "trendLabel", ["spike", "elevated", "normal"]),
-    correlations: countBy(incidentStore, "correlationLabel", ["critical_chain", "multi_signal", "none"]),
-    latest: {
-      incident: incidentStore[0] || null,
-      action: actionStore[0] || null
-    }
-  };
-}
-
-wss.on("connection", (socket) => {
-  socket.send(JSON.stringify({
-    type: "bootstrap",
-    incidents: incidentStore,
-    actions: actionStore,
-    summary: buildSummary()
-  }));
+    autoLearn: {
+      enabled: learningState.enabled,
+      minComparisons: learningState.minComparisons,
+      lastRunAt: learningState.lastRunAt || null
+    },
+    memoryUsers: userMemory.size,
+    time: nowIso()
+  });
 });
 
-
-app.post("/api/admin/clear-demo", async (_req, res) => {
+app.get("/api/incidents", async (req, res) => {
   try {
-    if (db) {
-      await db.close();
-      db = null;
-    }
+    const rows = await db.all(`SELECT * FROM incidents ORDER BY id DESC LIMIT 100`);
+    rows.forEach((r) => {
+      r.reasonCodes = parseJsonSafe(r.reasonCodes, []);
+    });
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
-    await fs.promises.unlink(DB_FILE).catch((err) => {
-      if (err && err.code !== "ENOENT") throw err;
+app.get("/api/actions", async (req, res) => {
+  try {
+    const rows = await db.all(`
+      SELECT id, user, action, severity, correlationLabel, createdAt
+      FROM incidents
+      ORDER BY id DESC
+      LIMIT 100
+    `);
+
+    const actions = rows.map((r) => ({
+      id: r.id,
+      type: r.action,
+      targetUser: r.user,
+      reason: r.correlationLabel && r.correlationLabel !== "none" ? r.correlationLabel : r.severity,
+      status: "issued",
+      engineSource: "signaldesk",
+      createdAt: r.createdAt
+    }));
+
+    res.json(actions);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/api/narratives", async (req, res) => {
+  try {
+    const rows = await db.all(`SELECT * FROM narratives ORDER BY id DESC LIMIT 100`);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/api/identity", (req, res) => {
+  const stats = getCurrentStats(globalEvents);
+  const drift = evaluateIdentityDrift(systemIdentity, stats);
+
+  res.json({
+    systemIdentity,
+    drift,
+    stats,
+    mqc: {
+      enabled: MQC_ENABLED,
+      mode: MQC_ENABLED ? MQC_MODE : "disabled"
+    },
+    autoLearn: {
+      enabled: learningState.enabled,
+      minComparisons: learningState.minComparisons,
+      lastRunAt: learningState.lastRunAt || null
+    },
+    userMemory: {
+      users: userMemory.size
+    }
+  });
+});
+
+app.get("/api/mqc", (req, res) => {
+  res.json({
+    ok: true,
+    enabled: MQC_ENABLED,
+    mode: MQC_ENABLED ? MQC_MODE : "disabled",
+    contract: {
+      source: "mqc-aegis",
+      modes: ["shadow", "primary"],
+      fields: [
+        "enabled",
+        "mode",
+        "source",
+        "riskDelta",
+        "recommendedAction",
+        "label",
+        "confidence"
+      ]
+    }
+  });
+});
+
+app.get("/api/mqc/compare", async (req, res) => {
+  try {
+    const rows = await db.all(`
+      SELECT *
+      FROM engine_comparisons
+      ORDER BY id DESC
+      LIMIT 100
+    `);
+
+    rows.forEach((r) => {
+      r.payload = parseJsonSafe(r.payload, {});
+      r.differs = Boolean(r.differs);
+      r.promotedByMQC = Boolean(r.promotedByMQC);
+      r.mqcEnabled = Boolean(r.mqcEnabled);
     });
 
-    incidentStore.length = 0;
-    actionStore.length = 0;
-    eventStore.length = 0;
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
-    await initDb();
+app.get("/api/mqc/stats", async (req, res) => {
+  try {
+    const stats = await getComparisonStats(db, 500);
+    const rows = await db.all(`
+      SELECT *
+      FROM learning_log
+      ORDER BY id DESC
+      LIMIT 1
+    `);
 
-    if (typeof broadcast === "function") {
-      broadcast({
-        type: "event_processed",
-        incidents: incidentStore,
-        actions: actionStore,
-        summary: {
-          totals: { incidents: 0, actions: 0, events: 0 },
-          severity: { critical: 0, high: 0, medium: 0, low: 0 },
-          actions: { block: 0, manual_review: 0, rate_limit: 0, allow: 0 },
-          trends: { spike: 0, elevated: 0, normal: 0 },
-          correlations: { critical_chain: 0, multi_signal: 0, none: 0 },
-          latest: { incident: null, action: null }
-        }
-      });
-    }
-
-    return res.json({
+    res.json({
       ok: true,
-      cleared: true,
-      db: "signaldesk.db",
-      incidents: 0,
-      actions: 0,
-      events: 0
+      total: stats.total,
+      differs: stats.differs,
+      promotedByMQC: stats.promotedByMQC,
+      diffRate: Number(stats.diffRate.toFixed(4)),
+      promotionRate: Number(stats.promotionRate.toFixed(4)),
+      avgMergedRisk: Number(stats.avgMergedRisk.toFixed(2)),
+      latestLearning: rows[0] || null
     });
   } catch (err) {
-    console.error("[SignalDesk] clear-demo failed:", err);
-    return res.status(500).json({
-      ok: false,
-      error: err.message || "Clear demo failed."
-    });
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
+app.get("/api/learning/logs", async (req, res) => {
+  try {
+    const rows = await db.all(`
+      SELECT *
+      FROM learning_log
+      ORDER BY id DESC
+      LIMIT 50
+    `);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
-app.get("/health", (_req, res) => {
-  const healthOk = !isShuttingDown && !!db;
-  res.status(healthOk ? 200 : 503).json({
-    ok: healthOk,
-    service: "SignalDesk",
-    phase: "D5",
-    env: NODE_ENV,
-    incidents: incidentStore.length,
-    actions: actionStore.length,
-    events: eventStore.length,
-    ws: true,
-    db: path.basename(DB_FILE),
-    shuttingDown: isShuttingDown
+app.post("/api/learning/run", async (req, res) => {
+  try {
+    const result = await runAutoLearn({
+      db,
+      persistLearningLog,
+      learningState,
+      systemIdentity,
+      globalEvents
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/api/learning/config", (req, res) => {
+  const body = req.body || {};
+
+  if (typeof body.enabled === "boolean") {
+    learningState.enabled = body.enabled;
+  }
+
+  if (Number.isFinite(body.minComparisons)) {
+    learningState.minComparisons = Math.max(3, Math.min(200, Math.round(body.minComparisons)));
+  }
+
+  res.json({
+    ok: true,
+    autoLearn: {
+      enabled: learningState.enabled,
+      minComparisons: learningState.minComparisons,
+      lastRunAt: learningState.lastRunAt || null
+    }
   });
 });
 
-app.get("/api/incidents", (req, res) => {
-  const incidents = applyIncidentFilters(incidentStore, req.query);
-  res.json({ ok: true, count: incidents.length, filters: req.query, incidents });
+app.get("/api/users/memory", async (req, res) => {
+  try {
+    const rows = await db.all(`
+      SELECT *
+      FROM user_memory
+      ORDER BY trustScore ASC, totalIncidents DESC, updatedAt DESC
+      LIMIT 100
+    `);
+
+    rows.forEach((r) => {
+      r.knownIps = parseJsonSafe(r.knownIps, []);
+    });
+
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
-app.get("/api/actions", (req, res) => {
-  const actions = applyActionFilters(actionStore, req.query);
-  res.json({ ok: true, count: actions.length, filters: req.query, actions });
+app.get("/api/users/memory/:user", async (req, res) => {
+  try {
+    const row = await db.get(`
+      SELECT *
+      FROM user_memory
+      WHERE user = ?
+    `, [req.params.user]);
+
+    if (!row) {
+      res.status(404).json({ ok: false, error: "user not found" });
+      return;
+    }
+
+    row.knownIps = parseJsonSafe(row.knownIps, []);
+    res.json(row);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
-app.get("/api/summary", (_req, res) => {
-  res.json({ ok: true, ...buildSummary() });
+app.get("/api/summary", async (req, res) => {
+  try {
+    const recentIncidents = await db.all(`
+      SELECT *
+      FROM incidents
+      ORDER BY id DESC
+      LIMIT 20
+    `);
+
+    recentIncidents.forEach((r) => {
+      r.reasonCodes = parseJsonSafe(r.reasonCodes, []);
+    });
+
+    const totals = await db.get(`
+      SELECT
+        COUNT(*) AS incidents,
+        COALESCE(SUM(CASE WHEN action IS NOT NULL AND action != '' THEN 1 ELSE 0 END), 0) AS actions
+      FROM incidents
+    `);
+
+    const narrativeTotals = await db.get(`
+      SELECT COUNT(*) AS narratives
+      FROM narratives
+    `);
+
+    const currentRisk = recentIncidents.length
+      ? recentIncidents.reduce((sum, r) => sum + Number(r.riskScore || 0), 0) / recentIncidents.length
+      : 0;
+
+    const stats = {
+      avgRisk: Number(currentRisk.toFixed(2)),
+      volume: recentIncidents.length
+    };
+
+    const drift = evaluateIdentityDrift(systemIdentity, stats);
+
+    const summary = generateSystemReflection(systemIdentity, drift, recentIncidents, {
+      mode: MQC_ENABLED ? MQC_MODE : "signaldesk-only",
+      source: "signaldesk"
+    });
+
+    res.json({
+      ok: true,
+      summary,
+      drift,
+      identity: systemIdentity,
+      incidents: totals?.incidents || 0,
+      actions: totals?.actions || 0,
+      narratives: narrativeTotals?.narratives || 0,
+      mqc: {
+        enabled: MQC_ENABLED,
+        mode: MQC_ENABLED ? MQC_MODE : "disabled"
+      },
+      autoLearn: {
+        enabled: learningState.enabled,
+        minComparisons: learningState.minComparisons,
+        lastRunAt: learningState.lastRunAt || null
+      },
+      userMemory: {
+        users: userMemory.size
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/api/insights", (req, res) => {
+  const stats = getCurrentStats(globalEvents);
+  const drift = evaluateIdentityDrift(systemIdentity, stats);
+  const summary = generateSystemReflection(systemIdentity, drift, incidentStore.slice(-20), {
+    mode: MQC_ENABLED ? MQC_MODE : "signaldesk-only",
+    source: "signaldesk"
+  });
+
+  res.json({
+    ok: true,
+    summary,
+    drift,
+    identity: systemIdentity,
+    mqc: {
+      enabled: MQC_ENABLED,
+      mode: MQC_ENABLED ? MQC_MODE : "disabled"
+    }
+  });
 });
 
 app.post("/event", async (req, res) => {
   try {
-    if (isShuttingDown) {
-      return res.status(503).json({ ok: false, error: "Service is shutting down" });
+    const body = req.body || {};
+    const event = {
+      id: globalEvents.length + 1,
+      type: body.type || "unknown",
+      user: body.user || "unknown",
+      attempts: Number(body.attempts || 0),
+      amount: Number(body.amount || 0),
+      ip: body.ip || "unknown",
+      risk: Number(body.risk || 0),
+      geoMismatch: Boolean(body.geoMismatch),
+      velocitySpike: Boolean(body.velocitySpike),
+      createdAt: nowIso()
+    };
+
+    globalEvents.push(event);
+    if (globalEvents.length > 1000) globalEvents.shift();
+
+    const mem = await updateUserMemoryFromEvent(db, userMemory, event);
+
+    const recentIncidentsForContext = incidentStore.filter(
+      (i) => Date.now() - new Date(i.createdAt).getTime() < 15 * 60 * 1000
+    );
+
+    const trendLabel = detectTrendAnomaly(event, trendStore);
+
+    const resolved = resolveDecisionEngine({
+      MQC_ENABLED,
+      MQC_MODE,
+      event,
+      context: { recentIncidents: recentIncidentsForContext.length },
+      mem
+    });
+
+    const riskScore = resolved.riskScore;
+    const memoryAdjustedRiskScore = resolved.memoryAdjustedRiskScore;
+    const memoryFactors = resolved.memoryFactors;
+    const convergence = resolved.convergence;
+    const engineMeta = resolved.engineMeta;
+    const comparison = resolved.comparison;
+    const severity = severityFromRisk(riskScore);
+    const finalAction = convergence.action || actionFromRisk(riskScore);
+
+    compareStore.unshift(comparison);
+    if (compareStore.length > 500) compareStore.pop();
+    await persistComparison(db, comparison);
+    broadcast("mqc_compare", comparison);
+
+    const gate = shouldCreateIncident(alertCooldown, event, riskScore, convergence);
+
+    let incident = null;
+    let narrative = null;
+    let actionRecord = null;
+
+    if (gate.allow) {
+      incident = {
+        id: incidentStore.length + 1,
+        type: event.type,
+        user: event.user,
+        riskScore,
+        severity,
+        action: finalAction,
+        status: finalAction === "block" ? "blocked" : "pending_review",
+        ip: event.ip,
+        amount: event.amount,
+        reasonCodes: buildReasonCodes(event, riskScore, convergence, memoryFactors),
+        correlationLabel: convergence.label,
+        trendLabel,
+        createdAt: nowIso()
+      };
+
+      incidentStore.push(incident);
+      if (incidentStore.length > 500) incidentStore.shift();
+
+      await persistIncident(db, incident);
+
+      actionRecord = {
+        id: actionStore.length + 1,
+        type: finalAction,
+        targetUser: event.user,
+        reason: convergence.label !== "none" ? convergence.label : severity,
+        status: "issued",
+        engineSource: convergence.source,
+        createdAt: nowIso()
+      };
+
+      actionStore.push(actionRecord);
+      if (actionStore.length > 500) actionStore.shift();
+
+      narrative = buildNarrative(event, {
+        action: finalAction,
+        label: convergence.label,
+        confidence: convergence.confidence
+      });
+
+      narrativeStore.push(narrative);
+      if (narrativeStore.length > 500) narrativeStore.shift();
+
+      await persistNarrative(db, narrative);
+
+      adaptSystemIdentity(systemIdentity, globalEvents, incidentStore.slice(-20));
+
+      broadcast("incident", incident);
+      broadcast("action", actionRecord);
+      broadcast("narrative", narrative);
     }
 
-    const normalized = normalizeEvent(req.body);
-    const trend = detectTrendAnomaly(normalized);
-    const correlation = detectCorrelation(normalized);
-    const riskResult = calculateRiskScore(normalized, trend, correlation);
+    const updatedMem = await updateUserMemoryFromDecision(db, mem, event, incident, actionRecord);
+    broadcast("user_memory", updatedMem);
 
-    const decision = decideAction(riskResult.score, {
-      trendLabel: trend.label,
-      correlationLabel: correlation.label
+    if (compareStore.length >= learningState.minComparisons && Date.now() - learningState.lastRunAt > 5000) {
+      try {
+        await runAutoLearn({
+          db,
+          persistLearningLog,
+          learningState,
+          systemIdentity,
+          globalEvents
+        });
+      } catch (err) {
+        console.error("Auto-learn failed:", err.message);
+      }
+    }
+
+    const stats = getCurrentStats(globalEvents);
+    const drift = evaluateIdentityDrift(systemIdentity, stats);
+    const reflection = generateSystemReflection(systemIdentity, drift, incidentStore.slice(-20), engineMeta);
+
+    broadcast("event", event);
+    broadcast("identity", {
+      identity: systemIdentity,
+      drift,
+      reflection,
+      mqc: {
+        enabled: MQC_ENABLED,
+        mode: MQC_ENABLED ? MQC_MODE : "disabled",
+        source: engineMeta.source
+      },
+      autoLearn: {
+        enabled: learningState.enabled,
+        minComparisons: learningState.minComparisons,
+        lastRunAt: learningState.lastRunAt || null
+      }
     });
 
-    const eventInsert = await db.run(
-      `INSERT INTO events (type, user, amount, risk, attempts, ip, geoMismatch, velocitySpike, timestamp)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        normalized.type,
-        normalized.user,
-        normalized.amount,
-        normalized.risk,
-        normalized.attempts,
-        normalized.ip,
-        normalized.geoMismatch ? 1 : 0,
-        normalized.velocitySpike ? 1 : 0,
-        normalized.timestamp
-      ]
-    );
-
-    const incidentDraft = createIncident(
-      normalized,
-      riskResult.score,
-      decision,
-      trend,
-      correlation,
-      riskResult.reasonCodes
-    );
-
-    const incidentInsert = await db.run(
-      `INSERT INTO incidents (
-        type, user, amount, ip, risk, riskScore, severity, action, status, reason,
-        reasonCodes, trendLabel, correlationLabel, geoMismatch, velocitySpike, attempts, createdAt
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        incidentDraft.type,
-        incidentDraft.user,
-        incidentDraft.amount,
-        incidentDraft.ip,
-        incidentDraft.risk,
-        incidentDraft.riskScore,
-        incidentDraft.severity,
-        incidentDraft.action,
-        incidentDraft.status,
-        incidentDraft.reason,
-        JSON.stringify(incidentDraft.reasonCodes),
-        incidentDraft.trendLabel,
-        incidentDraft.correlationLabel,
-        incidentDraft.geoMismatch ? 1 : 0,
-        incidentDraft.velocitySpike ? 1 : 0,
-        incidentDraft.attempts,
-        incidentDraft.createdAt
-      ]
-    );
-
-    const incident = { id: incidentInsert.lastID, ...incidentDraft };
-
-    const actionDraft = createActionLog(
-      normalized,
-      riskResult.score,
-      decision,
-      incident.id,
-      incident.trendLabel,
-      incident.correlationLabel
-    );
-
-    const actionInsert = await db.run(
-      `INSERT INTO actions (
-        incidentId, user, type, action, severity, status, reason,
-        riskScore, trendLabel, correlationLabel, createdAt
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        actionDraft.incidentId,
-        actionDraft.user,
-        actionDraft.type,
-        actionDraft.action,
-        actionDraft.severity,
-        actionDraft.status,
-        actionDraft.reason,
-        actionDraft.riskScore,
-        actionDraft.trendLabel,
-        actionDraft.correlationLabel,
-        actionDraft.createdAt
-      ]
-    );
-
-    const actionLog = { id: actionInsert.lastID, ...actionDraft };
-
-    eventStore.unshift({ id: eventInsert.lastID, ...normalized });
-    incidentStore.unshift(incident);
-    actionStore.unshift(actionLog);
-
-    if (eventStore.length > 500) eventStore.pop();
-    if (incidentStore.length > 100) incidentStore.pop();
-    if (actionStore.length > 100) actionStore.pop();
-
-    const summary = buildSummary();
-
-    broadcast({
-      type: "event_processed",
-      incident,
-      actionLog,
-      incidents: incidentStore,
-      actions: actionStore,
-      summary
-    });
-
-    return res.json({
+    res.json({
       ok: true,
-      event: normalized,
-      trend,
-      correlation,
-      riskScore: riskResult.score,
-      reasonCodes: riskResult.reasonCodes,
-      decision,
-      incidentCreated: true,
+      event,
+      incidentCreated: Boolean(incident),
       incident,
-      actionLogged: true,
-      actionLog,
-      summary
+      action: actionRecord,
+      narrative,
+      identity: systemIdentity,
+      drift,
+      reflection,
+      gate,
+      engineMeta,
+      memoryAdjustedRiskScore,
+      memoryFactors,
+      userMemory: updatedMem,
+      comparison,
+      mqc: {
+        enabled: MQC_ENABLED,
+        mode: MQC_ENABLED ? MQC_MODE : "disabled"
+      },
+      autoLearn: {
+        enabled: learningState.enabled,
+        minComparisons: learningState.minComparisons,
+        lastRunAt: learningState.lastRunAt || null
+      }
     });
   } catch (err) {
-    console.error("POST /event failed:", err);
-    return res.status(400).json({
+    res.status(500).json({
       ok: false,
-      error: err.message || "Invalid event payload"
+      error: err.message
     });
   }
 });
 
-app.get("/{*any}", (_req, res) => {
-  res.sendFile(path.join(publicDir, "index.html"));
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
+setWss(wss);
+
+wss.on("connection", (ws) => {
+  ws.send(
+    JSON.stringify({
+      type: "hello",
+      payload: {
+        message: "SignalDesk websocket connected",
+        time: nowIso(),
+        mqc: {
+          enabled: MQC_ENABLED,
+          mode: MQC_ENABLED ? MQC_MODE : "disabled"
+        },
+        autoLearn: {
+          enabled: learningState.enabled,
+          minComparisons: learningState.minComparisons,
+          lastRunAt: learningState.lastRunAt || null
+        },
+        userMemory: {
+          users: userMemory.size
+        }
+      }
+    })
+  );
 });
 
-async function shutdown(signal) {
-  if (isShuttingDown) return;
-  isShuttingDown = true;
-  console.log(`[SignalDesk] ${signal} received, shutting down gracefully...`);
-
-  wss.clients.forEach((client) => {
-    try { client.close(); } catch {}
-  });
-
-  server.close(async () => {
-    try {
-      if (db) await db.close();
-      console.log("[SignalDesk] Shutdown complete.");
-      process.exit(0);
-    } catch (err) {
-      console.error("[SignalDesk] Shutdown error:", err);
-      process.exit(1);
-    }
-  });
-
-  setTimeout(() => {
-    console.error("[SignalDesk] Forced shutdown after timeout.");
-    process.exit(1);
-  }, 10000).unref();
-}
-
-process.on("SIGINT", () => shutdown("SIGINT"));
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-
-process.on("unhandledRejection", (err) => {
-  console.error("[SignalDesk] Unhandled rejection:", err);
-});
-
-process.on("uncaughtException", (err) => {
-  console.error("[SignalDesk] Uncaught exception:", err);
-});
-
-async function start() {
-  await initDb();
-  await hydrateStores();
-
-  server.listen(PORT, HOST, () => {
-    console.log(`SignalDesk Phase D5 listening on http://${HOST}:${PORT}`);
-    console.log(`Using database: ${DB_FILE}`);
-    console.log(`Environment: ${NODE_ENV}`);
-  });
-}
-
-start().catch((err) => {
-  console.error("Failed to start SignalDesk:", err);
-  process.exit(1);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`SignalDesk listening on http://0.0.0.0:${PORT}`);
+  console.log(`MQC ready: enabled=${MQC_ENABLED} mode=${MQC_ENABLED ? MQC_MODE : "disabled"}`);
+  console.log(`Auto-learn: enabled=${learningState.enabled} minComparisons=${learningState.minComparisons}`);
+  console.log(`User memory loaded: ${userMemory.size}`);
 });

@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SignalDesk — Phase 2 + MQC + AutoLearn</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: Inter, Arial, sans-serif; background:#071226; color:#eaf1ff; }
+    .wrap { max-width:1500px; margin:0 auto; padding:24px; }
+    .hero { display:grid; gap:10px; margin-bottom:20px; }
+    .hero h1 { margin:0; font-size:40px; }
+    .hero p { margin:0; color:#9fb1d1; }
+
+    .grid { display:grid; grid-template-columns:repeat(12,1fr); gap:16px; }
+    .card {
+      background:linear-gradient(180deg,#0f1b35 0%,#0b1630 100%);
+      border:1px solid #20345c;
+      border-radius:18px;
+      padding:16px;
+      box-shadow:0 12px 30px rgba(0,0,0,.3);
+    }
+
+    .span-3{grid-column:span 3}
+    .span-4{grid-column:span 4}
+    .span-6{grid-column:span 6}
+    .span-8{grid-column:span 8}
+    .span-12{grid-column:span 12}
+
+    .label{font-size:12px;color:#8ea3c7;text-transform:uppercase;letter-spacing:.12em;margin-bottom:8px}
+    .metric{font-size:34px;font-weight:800}
+    .sub{font-size:13px;color:#9fb1d1;margin-top:6px}
+
+    .ok{color:#74f0b4}
+    .warn{color:#ffd166}
+    .bad{color:#ff7070}
+    .info{color:#7cc7ff}
+
+    .pill{
+      display:inline-block;
+      padding:6px 10px;
+      border-radius:999px;
+      font-size:12px;
+      font-weight:700;
+      background:#132447;
+      border:1px solid #2a4372;
+    }
+
+    .list{list-style:none;padding:0;margin:10px 0 0;display:grid;gap:10px;max-height:400px;overflow:auto}
+    .item{background:#0b1a33;border:1px solid #223a66;border-radius:14px;padding:10px}
+
+    .mono{font-family:monospace;font-size:12px;color:#cbd5ff;white-space:pre-wrap}
+
+    @media (max-width:1000px){
+      .span-3,.span-4,.span-6,.span-8,.span-12{grid-column:span 12}
+    }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hero">
+    <h1>SignalDesk — AutoLearn Live</h1>
+    <p>System that not only decides — but improves its own decisions</p>
+  </div>
+
+  <div class="grid">
+
+    <div class="card span-3">
+      <div class="label">Status</div>
+      <div id="status" class="metric">...</div>
+    </div>
+
+    <div class="card span-3">
+      <div class="label">Drift</div>
+      <div id="drift" class="metric">0</div>
+    </div>
+
+    <div class="card span-3">
+      <div class="label">Baseline Risk</div>
+      <div id="risk" class="metric">0</div>
+    </div>
+
+    <div class="card span-3">
+      <div class="label">Tolerance</div>
+      <div id="tolerance" class="metric">0</div>
+    </div>
+
+    <div class="card span-4">
+      <div class="label">Learning Cycles</div>
+      <div id="cycles" class="metric">0</div>
+      <div id="lastLearn" class="sub"></div>
+    </div>
+
+    <div class="card span-4">
+      <div class="label">Diff Rate</div>
+      <div id="diff" class="metric">0</div>
+    </div>
+
+    <div class="card span-4">
+      <div class="label">Promotion Rate</div>
+      <div id="promo" class="metric">0</div>
+    </div>
+
+    <div class="card span-6">
+      <div class="label">Last Learning Decision</div>
+      <div id="learningNote" class="mono">waiting...</div>
+    </div>
+
+    <div class="card span-6">
+      <div class="label">Recent Learning Logs</div>
+      <ul id="learningList" class="list"></ul>
+    </div>
+
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
