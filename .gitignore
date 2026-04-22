@@ -16,6 +16,9 @@ restart-financial.sh
 signaldesk.db.bak.*
 src/server.financial.broken.js
 src/server.financial.js
-src/server.js.save.*
+src/server.js.save.
+ HEAD
 public_dashboard/*.fix.*
 public_dashboard/*.bak.*
+public_dashboard/*.bak* 
+f328ebe (Ignore local dashboard backup files)
