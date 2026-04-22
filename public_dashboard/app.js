@@ -1,224 +1,402 @@
-async function fetchJson(url) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(url + " failed: " + res.status);
-  return res.json();
-}
+(() => {
+  const REFRESH_MS = 3000;
+  const API_BASE = "";
 
-const state = {
-  summary: {},
-  incidents: [],
-  actions: []
-};
-
-const el = (id) => document.getElementById(id);
-const safeText = (v, d = "—") => (v === undefined || v === null || v === "" ? d : v);
-
-function escapeHtml(value) {
-  return String(value ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
-
-function latestAction() {
-  return state.actions.length ? state.actions[state.actions.length - 1] : null;
-}
-
-function renderSummary() {
-  const s = state.summary || {};
-  const drift = s.drift || {};
-  const latest = latestAction();
-
-  if (el("statusValue")) el("statusValue").textContent = safeText(drift.status, "unknown");
-  if (el("driftValue")) el("driftValue").textContent = Number(drift.driftScore ?? 0).toFixed(2);
-  if (el("baselineRiskValue")) el("baselineRiskValue").textContent = safeText(drift.baselineRisk, 0);
-  if (el("eventsLoadedValue")) el("eventsLoadedValue").textContent = safeText(drift.currentVolume, 0);
-  if (el("avgRiskValue")) el("avgRiskValue").textContent = Number(drift.currentRisk ?? 0).toFixed(0);
-  if (el("topActionValue")) el("topActionValue").textContent = latest?.action || "observe";
-
-  if (el("systemReflection")) {
-    el("systemReflection").textContent = s.summary || "No summary available.";
-  }
-
-  if (el("serverModeChip")) {
-    el("serverModeChip").textContent = `Server mode: ${safeText(latest?.mode || s.mode, "signaldesk")}`;
-  }
-
-  if (el("currentDecisionWord")) {
-    el("currentDecisionWord").textContent = (latest?.action || "observe").toUpperCase();
-  }
-  if (el("currentDecisionSub")) {
-    el("currentDecisionSub").textContent = latest?.summary || "Awaiting live decision.";
-  }
-
-  if (el("signaldeskWord")) {
-    el("signaldeskWord").textContent = (latest?.action || "—").toUpperCase();
-  }
-  if (el("signaldeskSub")) {
-    el("signaldeskSub").textContent = latest?.explanation || "SignalDesk weighted rule engine";
-  }
-
-  if (el("mqcWord")) el("mqcWord").textContent = "—";
-  if (el("mqcSub")) el("mqcSub").textContent = "No comparison yet.";
-
-  if (el("nextActionWord")) {
-    el("nextActionWord").textContent =
-      latest?.action === "block"
-        ? "Block"
-        : latest?.action === "manual_review"
-        ? "Review"
-        : "Observe";
-  }
-  if (el("nextActionSub")) {
-    el("nextActionSub").textContent =
-      latest?.severity ? `${latest.severity} severity` : "Need more live data.";
-  }
-
-  if (el("divergenceWord")) el("divergenceWord").textContent = "Aligned";
-  if (el("divergenceSub")) el("divergenceSub").textContent = "No shadow comparison yet.";
-
-  renderLists(latest);
-}
-
-function renderLists(latest) {
-  const reasons = latest?.reasonCodes || latest?.reasons || [];
-  const reasonList = el("reasonList");
-  const memoryList = el("memoryList");
-  const runtimeList = el("runtimeList");
-
-  if (reasonList) {
-    reasonList.innerHTML = reasons.length
-      ? reasons.map(r => `<li>${escapeHtml(r)}</li>`).join("")
-      : "<li>No explicit reason codes.</li>";
-  }
-
-  if (el("decisionReasoning")) {
-    el("decisionReasoning").textContent = reasons.length
-      ? reasons.join(" • ")
-      : "No comparison data yet";
-  }
-
-  if (memoryList) {
-    memoryList.innerHTML = latest?.user
-      ? `<li>User: ${escapeHtml(latest.user)}</li><li>Mode: ${escapeHtml(latest.mode || "signaldesk")}</li>`
-      : "<li>No memory factors loaded.</li>";
-  }
-
-  if (runtimeList) {
-    runtimeList.innerHTML = latest
-      ? `<li>Latest event type: ${escapeHtml(latest.type || "event")}</li><li>Severity: ${escapeHtml(latest.severity || "unknown")}</li>`
-      : "<li>Waiting for scenario injection.</li>";
-  }
-}
-
-function renderActions() {
-  const container = el("decisionFeed");
-  if (!container) return;
-
-  if (!state.actions.length) {
-    container.innerHTML = '<div style="opacity:.75;padding:8px;">No decisions yet.</div>';
-    return;
-  }
-
-  const items = [...state.actions].slice(-8).reverse();
-
-  container.innerHTML = items.map((item) => `
-    <div style="padding:10px;border-bottom:1px solid rgba(120,170,255,.15);">
-      <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;">
-        <strong>${escapeHtml((item.action || "observe").toUpperCase())}</strong>
-        <span>${escapeHtml(item.severity || "unknown")} • ${escapeHtml(item.type || "event")}</span>
-      </div>
-      <div style="margin-top:4px;">user: ${escapeHtml(item.user || "unknown")}</div>
-      <div style="margin-top:4px;">score: ${escapeHtml(item.riskScore ?? "—")} • mode: ${escapeHtml(item.mode || "signaldesk")}</div>
-      <div style="margin-top:4px;opacity:.85;">${escapeHtml(item.summary || "No summary")}</div>
-    </div>
-  `).join("");
-}
-
-function renderIncidents() {
-  const liveEvents = el("liveEventsFeed");
-  if (liveEvents) {
-    const items = (state.incidents.length ? state.incidents : state.actions).slice(-8).reverse();
-
-    liveEvents.innerHTML = items.length
-      ? items.map((item) => `
-          <div style="padding:10px;border-bottom:1px solid rgba(120,170,255,.15);">
-            <div><strong>${escapeHtml(item.type || "event")}</strong> • ${escapeHtml(item.user || "unknown")}</div>
-            <div style="margin-top:4px;">severity: ${escapeHtml(item.severity || "—")} • action: ${escapeHtml(item.action || "—")}</div>
-            <div style="margin-top:4px;opacity:.85;">${escapeHtml(item.summary || "No summary")}</div>
-          </div>
-        `).join("")
-      : '<div style="opacity:.75;padding:8px;">No live events yet.</div>';
-  }
-
-  const mqcFeed = el("mqcFeed");
-  const latest = latestAction();
-
-  if (mqcFeed) {
-    mqcFeed.innerHTML = latest
-      ? `
-        <div style="padding:10px;">
-          <div><strong>${escapeHtml(latest.type || "event")}</strong> • ${escapeHtml(latest.user || "unknown")}</div>
-          <div style="margin-top:6px;">Action: ${escapeHtml(latest.action || "observe")}</div>
-          <div style="margin-top:6px;">Reasons: ${escapeHtml((latest.reasonCodes || latest.reasons || []).join(", ") || "none")}</div>
-        </div>
-      `
-      : '<div style="opacity:.75;padding:8px;">No insight yet.</div>';
-  }
-
-  renderRiskDistribution();
-}
-
-function renderRiskDistribution() {
-  const counts = { low: 0, medium: 0, high: 0, critical: 0 };
-
-  for (const item of state.actions) {
-    const score = Number(item.riskScore ?? 0);
-    if (score <= 44) counts.low++;
-    else if (score <= 71) counts.medium++;
-    else if (score <= 89) counts.high++;
-    else counts.critical++;
-  }
-
-  const total = Math.max(state.actions.length, 1);
-
-  const setBar = (barId, countId, count) => {
-    const bar = el(barId);
-    const countEl = el(countId);
-    const pct = Math.round((count / total) * 100);
-
-    if (bar) bar.style.width = `${pct}%`;
-    if (countEl) countEl.textContent = String(count);
+  const ACTION_PRIORITY = {
+    block: 4,
+    manual_review: 3,
+    rate_limit: 2,
+    observe: 1,
+    log: 0
   };
 
-  setBar("barLow", "countLow", counts.low);
-  setBar("barMedium", "countMedium", counts.medium);
-  setBar("barHigh", "countHigh", counts.high);
-  setBar("barCritical", "countCritical", counts.critical);
-}
+  const el = {
+    statusValue: document.getElementById("statusValue"),
+    statusSub: document.getElementById("statusSub"),
+    driftValue: document.getElementById("driftValue"),
+    driftSub: document.getElementById("driftSub"),
+    baselineRiskValue: document.getElementById("baselineRiskValue"),
+    baselineRiskSub: document.getElementById("baselineRiskSub"),
+    eventsLoadedValue: document.getElementById("eventsLoadedValue"),
+    eventsLoadedSub: document.getElementById("eventsLoadedSub"),
+    avgRiskValue: document.getElementById("avgRiskValue"),
+    avgRiskSub: document.getElementById("avgRiskSub"),
+    topActionValue: document.getElementById("topActionValue"),
+    topActionSub: document.getElementById("topActionSub"),
 
-async function loadAll() {
-  try {
-    const summary = await fetchJson("/api/summary").catch(() => null);
-    const incidentsData = await fetchJson("/api/incidents").catch(() => ({ items: [] }));
-    const actionsData = await fetchJson("/api/actions").catch(() => ({ items: [] }));
+    currentDecisionValue: document.getElementById("currentDecisionValue"),
+    currentDecisionSub: document.getElementById("currentDecisionSub"),
+    signalDeskValue: document.getElementById("signalDeskValue"),
+    signalDeskSub: document.getElementById("signalDeskSub"),
+    mqcSuggestionValue: document.getElementById("mqcSuggestionValue"),
+    mqcSuggestionSub: document.getElementById("mqcSuggestionSub"),
+    nextBestActionValue: document.getElementById("nextBestActionValue"),
+    nextBestActionSub: document.getElementById("nextBestActionSub"),
 
-    state.summary = summary || {};
-    state.incidents = Array.isArray(incidentsData.items) ? incidentsData.items : [];
-    state.actions = Array.isArray(actionsData.items) ? actionsData.items : [];
+    decisionReasoning: document.getElementById("decisionReasoning"),
+    memoryFactors: document.getElementById("memoryFactors"),
+    runtimeNotes: document.getElementById("runtimeNotes"),
+    divergenceExplanation: document.getElementById("divergenceExplanation"),
+    systemReflection: document.getElementById("systemReflection"),
 
-    renderSummary();
-    renderIncidents();
-    renderActions();
-  } catch (err) {
-    console.error("loadAll total fail:", err);
-    if (el("systemReflection")) {
-      el("systemReflection").textContent = "Load failed: " + err.message;
+    incidentList: document.getElementById("incidentList"),
+    decisionFeed: document.getElementById("decisionFeed"),
+    mqcInsightFeed: document.getElementById("mqcInsightFeed"),
+
+    bucketLowBar: document.getElementById("bucketLowBar"),
+    bucketLowCount: document.getElementById("bucketLowCount"),
+    bucketMediumBar: document.getElementById("bucketMediumBar"),
+    bucketMediumCount: document.getElementById("bucketMediumCount"),
+    bucketHighBar: document.getElementById("bucketHighBar"),
+    bucketHighCount: document.getElementById("bucketHighCount"),
+    bucketCriticalBar: document.getElementById("bucketCriticalBar"),
+    bucketCriticalCount: document.getElementById("bucketCriticalCount"),
+
+    connectionStatus: document.getElementById("connectionStatus"),
+    authStatus: document.getElementById("authStatus")
+  };
+
+  function setText(node, value) {
+    if (node) node.textContent = value;
+  }
+
+  function setHTML(node, value) {
+    if (node) node.innerHTML = value;
+  }
+
+  function esc(value) {
+    return String(value ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;");
+  }
+
+  function niceAction(action) {
+    return String(action || "observe").replaceAll("_", " ");
+  }
+
+  function upperAction(action) {
+    return niceAction(action).toUpperCase();
+  }
+
+  function formatTime(value) {
+    if (!value) return "n/a";
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return "n/a";
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  }
+
+  function formatScore(value) {
+    const n = Number(value);
+    return Number.isFinite(n) ? String(Math.round(n)) : "n/a";
+  }
+
+  function severityClass(severity, score) {
+    const s = String(severity || "").toLowerCase();
+    if (s === "critical") return "critical";
+    if (s === "high") return "high";
+    if (s === "medium") return "medium";
+    if (s === "low") return "low";
+
+    const n = Number(score);
+    if (!Number.isFinite(n)) return "low";
+    if (n >= 90) return "critical";
+    if (n >= 72) return "high";
+    if (n >= 45) return "medium";
+    return "low";
+  }
+
+  async function getJSON(path) {
+    const res = await fetch(`${API_BASE}${path}`, {
+      headers: { Accept: "application/json" },
+      cache: "no-store"
+    });
+    if (!res.ok) {
+      throw new Error(`${path} -> HTTP ${res.status}`);
+    }
+    return res.json();
+  }
+
+  function normalizeIncidents(raw) {
+    const list = Array.isArray(raw) ? raw : [];
+    return list
+      .map((item) => {
+        const riskScore = Number.isFinite(Number(item?.riskScore))
+          ? Number(item.riskScore)
+          : (Number.isFinite(Number(item?.risk)) ? Number(item.risk) : null);
+
+        const createdAtTs = new Date(item?.createdAt || 0).getTime() || 0;
+
+        return {
+          ...item,
+          riskScore,
+          createdAtTs
+        };
+      })
+      .sort((a, b) => b.createdAtTs - a.createdAtTs);
+  }
+
+  function computeAvgRisk(incidents) {
+    const scored = incidents.filter((i) => Number.isFinite(i.riskScore));
+    if (!scored.length) return 0;
+    const sum = scored.reduce((acc, item) => acc + item.riskScore, 0);
+    return Math.round(sum / scored.length);
+  }
+
+  function computeTopAction(incidents) {
+    const actions = incidents.slice(0, 20).map((i) => i?.action).filter(Boolean);
+    if (!actions.length) return "observe";
+    return actions.sort((a, b) => (ACTION_PRIORITY[b] || 0) - (ACTION_PRIORITY[a] || 0))[0] || "observe";
+  }
+
+  function computeBuckets(incidents) {
+    const buckets = { low: 0, medium: 0, high: 0, critical: 0 };
+
+    for (const item of incidents) {
+      const score = Number(item?.riskScore);
+      if (!Number.isFinite(score)) continue;
+
+      if (score <= 44) buckets.low++;
+      else if (score <= 71) buckets.medium++;
+      else if (score <= 89) buckets.high++;
+      else buckets.critical++;
+    }
+
+    return buckets;
+  }
+
+  function renderReasonCodes(item) {
+    const codes = Array.isArray(item?.reasonCodes) ? item.reasonCodes : [];
+    if (!codes.length) {
+      return `<ul class="clean"><li>No explicit reason codes.</li></ul>`;
+    }
+    return `<ul class="clean">${codes.map((c) => `<li>${esc(c)}</li>`).join("")}</ul>`;
+  }
+
+  function renderMemoryFactors(item) {
+    const codes = Array.isArray(item?.reasonCodes) ? item.reasonCodes : [];
+    const memoryCodes = codes.filter((c) => String(c).startsWith("MEMORY_"));
+
+    if (!memoryCodes.length) {
+      return `
+        <div>No memory factors triggered</div>
+        <div style="margin-top:8px;opacity:.8;">Latest user: ${esc(item?.user || "unknown")}</div>
+      `;
+    }
+
+    return `
+      <div>${memoryCodes.slice(0, 4).map(esc).join(", ")}</div>
+      <div style="margin-top:8px;opacity:.8;">Latest user: ${esc(item?.user || "unknown")}</div>
+    `;
+  }
+
+  function renderRuntimeNotes(item) {
+    if (!item) return `Awaiting live incident.`;
+
+    return `
+      <div>Latest event type: <b>${esc(item?.type || "unknown")}</b></div>
+      <div>Severity: <b>${esc(item?.severity || "unknown")}</b></div>
+      <div>Status: <b>${esc(item?.status || "issued")}</b></div>
+      <div>Time: <b>${esc(formatTime(item?.createdAt))}</b></div>
+    `;
+  }
+
+  function renderDivergence(summary) {
+    const enabled = Boolean(summary?.mqc?.enabled);
+
+    if (!enabled) {
+      return `
+        <div class="strong" style="color:#93c5fd;">Aligned</div>
+        <div style="margin-top:6px;">No shadow comparison yet.</div>
+        <div style="margin-top:8px;">SignalDesk is driving the decision stream from the incident engine in this build.</div>
+      `;
+    }
+
+    return `
+      <div class="strong" style="color:#93c5fd;">Comparison active</div>
+      <div style="margin-top:6px;">MQC comparison stream available.</div>
+    `;
+  }
+
+  function renderReflection(summary, latestIncident, avgRisk, incidents) {
+    const driftStatus = summary?.drift?.status || "unknown";
+    const driftScore = Number.isFinite(Number(summary?.drift?.driftScore))
+      ? Number(summary.drift.driftScore).toFixed(2)
+      : "n/a";
+    const engineMode = summary?.mqc?.enabled ? (summary?.mqc?.mode || "comparison") : "signaldesk";
+    const currentVolume = incidents.length;
+    const latestDecisionTime = formatTime(latestIncident?.createdAt);
+
+    return `System status: ${driftStatus}. Drift score: ${driftScore}. Engine mode: ${engineMode}. Current avg risk: ${avgRisk}. Current volume: ${currentVolume}. Latest decision time: ${latestDecisionTime}.`;
+  }
+
+  function renderIncidentCards(incidents) {
+    if (!incidents.length) {
+      return `<div class="empty-state">No live incidents yet.</div>`;
+    }
+
+    return incidents.slice(0, 12).map((item) => `
+      <div class="card ${severityClass(item?.severity, item?.riskScore)}">
+        <div class="row">
+          <div>
+            <div class="strong">${esc(item?.type || "event")} • ${esc(item?.user || "unknown")}</div>
+            <div>severity: <b>${esc(item?.severity || "unknown")}</b> • action: <b>${esc(item?.action || "observe")}</b></div>
+          </div>
+          <div class="muted">${esc(formatTime(item?.createdAt))}</div>
+        </div>
+        <div style="margin-top:6px;word-break:break-word;">
+          ${Array.isArray(item?.reasonCodes) && item.reasonCodes.length
+            ? esc(item.reasonCodes.join(", "))
+            : "No explicit reason codes."}
+        </div>
+      </div>
+    `).join("");
+  }
+
+  function renderDecisionFeed(incidents) {
+    if (!incidents.length) {
+      return `<div class="empty-state">Awaiting decision stream.</div>`;
+    }
+
+    return incidents.slice(0, 6).map((item) => `
+      <div class="card low">
+        <div class="row">
+          <div class="strong">${esc(upperAction(item?.action))}</div>
+          <div class="muted">${esc(item?.user || "unknown")} • ${esc(niceAction(item?.action))} • ${esc(formatTime(item?.createdAt))}</div>
+        </div>
+        <div style="margin-top:4px;">user: ${esc(item?.user || "unknown")}</div>
+        <div>score: ${esc(formatScore(item?.riskScore))} • status: ${esc(item?.status || "issued")}</div>
+        <div style="margin-top:4px;">${esc(item?.summary || "Narrative pending")}</div>
+      </div>
+    `).join("");
+  }
+
+  function renderMQCFeed(incidents, summary) {
+    const latest = incidents[0];
+
+    if (!summary?.mqc?.enabled) {
+      return `
+        <div class="card low">
+          <div class="row">
+            <div class="strong">${esc(latest?.action || "observe")} • ${esc(latest?.user || "unknown")}</div>
+            <div class="muted">${esc(formatTime(latest?.createdAt))}</div>
+          </div>
+          <div style="margin-top:4px;">Action: <b>observe</b></div>
+          <div>Reasons: MQC disabled in this build</div>
+        </div>
+      `;
+    }
+
+    return `
+      <div class="card low">
+        <div>MQC comparison stream active.</div>
+      </div>
+    `;
+  }
+
+  function updateRiskBars(buckets) {
+    const total = Object.values(buckets).reduce((a, b) => a + b, 0) || 1;
+
+    setText(el.bucketLowCount, String(buckets.low));
+    setText(el.bucketMediumCount, String(buckets.medium));
+    setText(el.bucketHighCount, String(buckets.high));
+    setText(el.bucketCriticalCount, String(buckets.critical));
+
+    if (el.bucketLowBar) el.bucketLowBar.style.width = `${(buckets.low / total) * 100}%`;
+    if (el.bucketMediumBar) el.bucketMediumBar.style.width = `${(buckets.medium / total) * 100}%`;
+    if (el.bucketHighBar) el.bucketHighBar.style.width = `${(buckets.high / total) * 100}%`;
+    if (el.bucketCriticalBar) el.bucketCriticalBar.style.width = `${(buckets.critical / total) * 100}%`;
+  }
+
+  async function refresh() {
+    try {
+      setText(el.connectionStatus, "connecting...");
+      setText(el.authStatus, "live");
+
+      const [rawIncidents, rawActions, summary] = await Promise.all([
+        getJSON("/api/incidents"),
+        getJSON("/api/actions").catch(() => []),
+        getJSON("/api/summary")
+      ]);
+
+      const incidents = normalizeIncidents(rawIncidents);
+      const latestIncident = incidents[0] || null;
+      const avgRisk = computeAvgRisk(incidents);
+      const topAction = computeTopAction(incidents);
+      const buckets = computeBuckets(incidents);
+
+      setText(el.statusValue, String(summary?.drift?.status || "unknown"));
+      setText(el.statusSub, "Adaptive recalibration required");
+
+      setText(
+        el.driftValue,
+        Number.isFinite(Number(summary?.drift?.driftScore))
+          ? Number(summary.drift.driftScore).toFixed(2)
+          : "0.00"
+      );
+      setText(el.driftSub, "Identity drift");
+
+      setText(el.baselineRiskValue, String(summary?.identity?.baselineRisk ?? summary?.drift?.baselineRisk ?? 0));
+      setText(el.baselineRiskSub, "System baseline");
+
+      setText(el.eventsLoadedValue, String(incidents.length));
+      setText(el.eventsLoadedSub, "Recent live events");
+
+      setText(el.avgRiskValue, String(avgRisk));
+      setText(el.avgRiskSub, "Recent average");
+
+      setText(el.topActionValue, niceAction(topAction));
+      setText(el.topActionSub, "Strongest recent action");
+
+      setText(el.currentDecisionValue, upperAction(latestIncident?.action || "observe"));
+      setText(
+        el.currentDecisionSub,
+        latestIncident?.riskScore != null
+          ? `Score — ${formatScore(latestIncident.riskScore)}`
+          : "Score — n/a"
+      );
+
+      setText(el.signalDeskValue, "Active");
+      setText(el.signalDeskSub, "SignalDesk weighted rule engine");
+
+      setText(el.mqcSuggestionValue, summary?.mqc?.enabled ? "Active" : "Inactive");
+      setText(
+        el.mqcSuggestionSub,
+        summary?.mqc?.enabled ? "Comparison stream available" : "MQC disabled in this build"
+      );
+
+      setText(el.nextBestActionValue, niceAction(latestIncident?.action || topAction || "observe"));
+      setText(el.nextBestActionSub, latestIncident ? "Derived from latest incident" : "Await next signal");
+
+      setHTML(el.decisionReasoning, renderReasonCodes(latestIncident));
+      setHTML(el.memoryFactors, renderMemoryFactors(latestIncident));
+      setHTML(el.runtimeNotes, renderRuntimeNotes(latestIncident));
+      setHTML(el.divergenceExplanation, renderDivergence(summary));
+      setText(el.systemReflection, renderReflection(summary, latestIncident, avgRisk, incidents));
+
+      setHTML(el.incidentList, renderIncidentCards(incidents));
+      setHTML(el.decisionFeed, renderDecisionFeed(incidents));
+      setHTML(el.mqcInsightFeed, renderMQCFeed(incidents, summary));
+
+      updateRiskBars(buckets);
+
+      setText(el.connectionStatus, "connected");
+    } catch (err) {
+      console.error("[SignalDesk UI] refresh failed:", err);
+      setText(el.connectionStatus, "offline");
+      setText(el.authStatus, "error");
+      setText(el.systemReflection, `Dashboard refresh failed: ${err.message}`);
     }
   }
-}
 
-setInterval(loadAll, 2000);
-loadAll();
+  function boot() {
+    refresh();
+    setInterval(refresh, REFRESH_MS);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", boot);
+  } else {
+    boot();
+  }
+})();
